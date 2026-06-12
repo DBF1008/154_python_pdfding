@@ -64,3 +64,45 @@ class TestEncryption(TestCase):
         tmp_file_path.unlink()
 
         self.assertEqual(tmp_file_contents, b'"""some content for encryption test"""\ndecrypted')
+
+    @mock.patch('backup.service.Fernet')
+    def test_validate_encryption_key_valid(self, mock_fernet_cls):
+        mock_fernet_instance = mock.Mock()
+        mock_fernet_instance.decrypt.return_value = b'decrypted'
+        mock_fernet_cls.return_value = mock_fernet_instance
+
+        result = service.validate_encryption_key(b'key', b'sample_data')
+
+        self.assertTrue(result)
+        mock_fernet_cls.assert_called_with(b'key')
+        mock_fernet_instance.decrypt.assert_called_with(b'sample_data')
+
+    @mock.patch('backup.service.Fernet')
+    def test_validate_encryption_key_invalid(self, mock_fernet_cls):
+        from cryptography.fernet import InvalidToken
+
+        mock_fernet_instance = mock.Mock()
+        mock_fernet_instance.decrypt.side_effect = InvalidToken
+        mock_fernet_cls.return_value = mock_fernet_instance
+
+        result = service.validate_encryption_key(b'key', b'sample_data')
+
+        self.assertFalse(result)
+
+    def test_is_fernet_ciphertext_true(self):
+        # Fernet tokens start with version byte 0x80, which base64-encodes to 'gA'
+        # Build a plausible Fernet-like token: 'gA' prefix + padding to exceed 57 bytes
+        sample = b'gA' + b'A' * 55
+
+        self.assertTrue(service.is_fernet_ciphertext(sample))
+
+    def test_is_fernet_ciphertext_false(self):
+        # Regular PDF header — not Fernet ciphertext
+        sample = b'%PDF-1.4 this is a regular PDF file header with enough length to pass the size check!!'
+
+        self.assertFalse(service.is_fernet_ciphertext(sample))
+
+    def test_is_fernet_ciphertext_too_short(self):
+        sample = b'gAAA'
+
+        self.assertFalse(service.is_fernet_ciphertext(sample))

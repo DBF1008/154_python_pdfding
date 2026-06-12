@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -75,3 +75,35 @@ def decrypt_file(encryption_key: bytes, source_path: Path, target_path: Path):
     # writing the decrypted data
     with open(target_path, 'wb') as dec_file:
         dec_file.write(decrypted)
+
+
+def validate_encryption_key(encryption_key: bytes, sample_data: bytes) -> bool:
+    """
+    Attempt to decrypt sample data with the given key.
+    Returns True if decryption succeeds, False otherwise.
+    Does NOT raise — catches InvalidToken internally.
+    """
+
+    try:
+        f = Fernet(encryption_key)
+        f.decrypt(sample_data)
+        return True
+    except InvalidToken:
+        return False
+
+
+def is_fernet_ciphertext(data: bytes) -> bool:
+    """
+    Heuristic check: Fernet tokens are URL-safe base64 starting with version byte 0x80.
+    In base64 encoding, this produces a 'gA' prefix. Also validates minimum length
+    (Fernet tokens are at least ~57 bytes).
+    """
+
+    if len(data) < 57:
+        return False
+
+    try:
+        decoded = base64.urlsafe_b64decode(data[:4] + b'==')
+        return decoded[0] == 0x80
+    except Exception:
+        return False
