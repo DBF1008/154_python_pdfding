@@ -3,11 +3,12 @@ from io import BytesIO
 
 import qrcode
 from base import base_views
+from base.service import construct_query_overview_url
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
 from django.contrib.sessions.models import Session
 from django.core.files import File
-from django.db.models import Q, QuerySet
+from django.db.models import F, Q, QuerySet
 from django.db.models.functions import Lower
 from django.http import Http404, HttpRequest
 from django.shortcuts import redirect, render
@@ -15,6 +16,7 @@ from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
 from django.views import View
+from rapidfuzz import fuzz, utils
 from pdf.forms import (
     SharedDeletionDateForm,
     SharedDescriptionForm,
@@ -124,19 +126,71 @@ class OverviewMixin(BaseShareMixin):
 
         return sorting_dict[profile.shared_pdf_sorting]
 
-    @staticmethod
-    def filter_objects(request: HttpRequest) -> QuerySet:
-        """
-        Filter the shared PDFs when performing a search in the overview. As there is no search functionality, this is
-        just a dummy function
-        """
+    @classmethod
+    def filter_objects(cls, request: HttpRequest) -> QuerySet:
+        """Filter the shared PDFs based on search, status, and password filters."""
 
         shared_pdfs = request.user.profile.current_shared_pdfs
+
+        # always exclude deleted shares (scheduled deletion date has passed)
         shared_pdfs = shared_pdfs.filter(
             Q(deletion_date__isnull=True) | Q(deletion_date__gt=datetime.now(timezone.utc))
         )
 
+        # status filter (DB-level)
+        status = request.GET.get('status', '')
+        now = datetime.now(timezone.utc)
+
+        if status == 'active':
+            shared_pdfs = shared_pdfs.filter(
+                Q(expiration_date__isnull=True) | Q(expiration_date__gt=now)
+            ).filter(
+                Q(max_views__isnull=True) | Q(views__lt=F('max_views'))
+            )
+        elif status == 'expired':
+            shared_pdfs = shared_pdfs.filter(
+                Q(expiration_date__isnull=False, expiration_date__lte=now)
+                | Q(max_views__isnull=False, views__gte=F('max_views'))
+            )
+
+        # password filter (DB-level)
+        password_filter = request.GET.get('password', '')
+
+        if password_filter == 'protected':
+            shared_pdfs = shared_pdfs.exclude(Q(password__isnull=True) | Q(password=''))
+        elif password_filter == 'unprotected':
+            shared_pdfs = shared_pdfs.filter(Q(password__isnull=True) | Q(password=''))
+
+        # fuzzy text search against share name and underlying PDF name
+        search = request.GET.get('search', '')
+
+        if search:
+            shared_pdfs = cls.fuzzy_filter_shared_pdfs(shared_pdfs, search)
+
         return shared_pdfs
+
+    @staticmethod
+    def fuzzy_filter_shared_pdfs(shared_pdfs: QuerySet, search: str) -> QuerySet:
+        """Fuzzy match against both share name and underlying PDF name."""
+
+        fuzzy_result = []
+
+        for shared_pdf in shared_pdfs.select_related('pdf'):
+            # check share name
+            w_ratio_name = fuzz.WRatio(search, shared_pdf.name, processor=utils.default_process)
+            partial_ratio_name = fuzz.partial_ratio(search, shared_pdf.name, processor=utils.default_process)
+
+            # check underlying PDF name
+            w_ratio_pdf = fuzz.WRatio(search, shared_pdf.pdf.name, processor=utils.default_process)
+            partial_ratio_pdf = fuzz.partial_ratio(search, shared_pdf.pdf.name, processor=utils.default_process)
+
+            name_match = (w_ratio_name + partial_ratio_name) / 2 > 85 or partial_ratio_name > 95
+            pdf_match = (w_ratio_pdf + partial_ratio_pdf) / 2 > 85 or partial_ratio_pdf > 95
+
+            if name_match or pdf_match:
+                fuzzy_result.append(shared_pdf.id)
+
+        return shared_pdfs.filter(id__in=fuzzy_result)
 
     @staticmethod
     def get_extra_context(request: HttpRequest) -> dict:  # pragma: no cover
@@ -147,6 +201,9 @@ class OverviewMixin(BaseShareMixin):
             'current_collection_id': request.user.profile.current_collection_id,
             'current_collection_name': request.user.profile.current_collection_name,
             'current_workspace_id': request.user.profile.current_workspace_id,
+            'search_query': request.GET.get('search', ''),
+            'status_filter': request.GET.get('status', ''),
+            'password_filter': request.GET.get('password', ''),
         }
 
 
@@ -257,7 +314,35 @@ class Overview(OverviewMixin, base_views.BaseOverview):
 
 
 class OverviewQuery(BaseShareMixin, base_views.BaseOverviewQuery):
-    """View for performing searches and sorting on the shared PDF overview page."""
+    """View for performing searches and filtering on the shared PDF overview page."""
+
+    def get(self, request: HttpRequest):
+        referer_url = request.META.get('HTTP_REFERER', f'{self.obj_name}_overview')
+
+        search_query = request.GET.get('search', '')
+        remove_tag_query = request.GET.get('remove', '')
+        special_selection_query = request.GET.get('selection', '')
+        status_query = request.GET.get('status', '')
+        password_query = request.GET.get('password', '')
+
+        # use base class URL construction for search/tags/selection
+        redirect_url = construct_query_overview_url(
+            referer_url, search_query, special_selection_query, remove_tag_query, self.obj_name
+        )
+
+        # append shared-PDF-specific filter params
+        extra_params = []
+
+        if status_query:
+            extra_params.append(f'status={status_query}')
+        if password_query:
+            extra_params.append(f'password={password_query}')
+
+        if extra_params:
+            separator = '&' if '?' in redirect_url else '?'
+            redirect_url = f'{redirect_url}{separator}{"&".join(extra_params)}'
+
+        return redirect(redirect_url)
 
 
 class Delete(SharedPdfMixin, base_views.BaseDelete):
