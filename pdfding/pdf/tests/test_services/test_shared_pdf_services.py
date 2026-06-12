@@ -10,6 +10,7 @@ from pdf.models.shared_pdf_models import SharedPdf
 from pdf.services.shared_pdf_services import (
     check_shared_access_allowed,
     check_shared_access_allowed_by_identifier,
+    construct_shared_query_overview_url,
     get_future_datetime,
 )
 
@@ -90,3 +91,67 @@ class TestSharedPdfServices(TestCase):
 
     def test_get_future_datetime_empty(self):
         self.assertEqual(get_future_datetime(''), None)
+
+
+class TestConstructSharedQueryOverviewUrl(TestCase):
+    def setUp(self):
+        self.overview_url = reverse('shared_pdf_overview')
+
+    def test_no_changes_empty_referer(self):
+        generated_url = construct_shared_query_overview_url(self.overview_url, None, None, None)
+
+        self.assertEqual(generated_url, self.overview_url)
+
+    def test_set_search(self):
+        # multiple words are joined with '+'
+        generated_url = construct_shared_query_overview_url(self.overview_url, 'foo bar', None, None)
+
+        self.assertEqual(generated_url, f'{self.overview_url}?search=foo+bar')
+
+    def test_set_expiration(self):
+        generated_url = construct_shared_query_overview_url(self.overview_url, None, 'active', None)
+
+        self.assertEqual(generated_url, f'{self.overview_url}?expiration=active')
+
+    def test_set_password(self):
+        generated_url = construct_shared_query_overview_url(self.overview_url, None, None, 'yes')
+
+        self.assertEqual(generated_url, f'{self.overview_url}?password=yes')
+
+    def test_filters_are_combinable(self):
+        # a status filter is added without dropping the existing search
+        referer_url = f'{self.overview_url}?search=foo'
+        generated_url = construct_shared_query_overview_url(referer_url, None, 'expired', None)
+
+        self.assertEqual(generated_url, f'{self.overview_url}?search=foo&expiration=expired')
+
+    def test_filters_stack(self):
+        # a third filter is added on top of an already combined search + expiration filter
+        referer_url = f'{self.overview_url}?search=foo&expiration=expired'
+        generated_url = construct_shared_query_overview_url(referer_url, None, None, 'yes')
+
+        self.assertEqual(generated_url, f'{self.overview_url}?search=foo&expiration=expired&password=yes')
+
+    def test_none_keeps_existing_filters(self):
+        referer_url = f'{self.overview_url}?search=foo&expiration=active&password=yes'
+        generated_url = construct_shared_query_overview_url(referer_url, None, None, None)
+
+        self.assertEqual(generated_url, referer_url)
+
+    def test_empty_search_resets_search_only(self):
+        referer_url = f'{self.overview_url}?search=foo&password=no'
+        generated_url = construct_shared_query_overview_url(referer_url, '', None, None)
+
+        self.assertEqual(generated_url, f'{self.overview_url}?password=no')
+
+    def test_empty_expiration_resets_expiration_only(self):
+        referer_url = f'{self.overview_url}?expiration=active&password=yes'
+        generated_url = construct_shared_query_overview_url(referer_url, None, '', None)
+
+        self.assertEqual(generated_url, f'{self.overview_url}?password=yes')
+
+    def test_invalid_status_value_resets_filter(self):
+        referer_url = f'{self.overview_url}?expiration=active'
+        generated_url = construct_shared_query_overview_url(referer_url, None, 'garbage', None)
+
+        self.assertEqual(generated_url, self.overview_url)

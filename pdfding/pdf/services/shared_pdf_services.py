@@ -1,7 +1,13 @@
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlparse
 
 from django.contrib.sessions.models import Session
+from django.urls import reverse
 from pdf.models.shared_pdf_models import SharedPdf
+
+# allowed values for the combinable status filters of the shared PDF overview
+EXPIRATION_FILTER_VALUES = ('active', 'expired')
+PASSWORD_FILTER_VALUES = ('yes', 'no')
 
 
 def check_shared_access_allowed_by_identifier(identifier: str, session: Session):
@@ -49,3 +55,58 @@ def get_future_datetime(time_input: str) -> datetime | None:
     future_date = now + timedelta(days=days, hours=hours, minutes=minutes)
 
     return future_date
+
+
+def construct_shared_query_overview_url(
+    referer_url: str,
+    search_query: str | None,
+    expiration_query: str | None,
+    password_query: str | None,
+) -> str:
+    """
+    Construct the shared PDF overview url after performing a search or changing a status filter.
+
+    Search and the status filters (expiration + password) can be combined freely. Only the parameters present in the
+    current request are changed; the others are kept from the referer so the filters stack. A parameter is reset by
+    providing it with an empty (or otherwise invalid) value, e.g. "search=" or "expiration=".
+    """
+
+    parsed_referer_url = urlparse(referer_url)
+    query_parameters = parse_qs(parsed_referer_url.query)
+
+    # search is free text; None keeps the existing search, an empty string resets it
+    if search_query is not None:
+        search = search_query.strip().replace(' ', '+')
+        if search:
+            query_parameters['search'] = [search]
+        else:
+            query_parameters.pop('search', None)
+
+    _apply_status_filter(query_parameters, 'expiration', expiration_query, EXPIRATION_FILTER_VALUES)
+    _apply_status_filter(query_parameters, 'password', password_query, PASSWORD_FILTER_VALUES)
+
+    query_string = '&'.join(
+        f'{key}={"+".join(query)}' for key, query in query_parameters.items() if query not in [[], ['']]
+    )
+
+    overview_url = reverse('shared_pdf_overview')
+
+    if query_string:
+        overview_url = f'{overview_url}?{query_string}'
+
+    return overview_url
+
+
+def _apply_status_filter(query_parameters: dict, key: str, value: str | None, allowed_values: tuple) -> None:
+    """
+    Apply a single status filter to the query parameters. None keeps the existing value, a value from allowed_values
+    sets it and any other value (e.g. an empty string) resets the filter.
+    """
+
+    if value is None:
+        return
+
+    if value in allowed_values:
+        query_parameters[key] = [value]
+    else:
+        query_parameters.pop(key, None)

@@ -7,7 +7,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
 from django.contrib.sessions.models import Session
 from django.core.files import File
-from django.db.models import Q, QuerySet
+from django.db.models import F, Q, QuerySet
 from django.db.models.functions import Lower
 from django.http import Http404, HttpRequest
 from django.shortcuts import redirect, render
@@ -28,13 +28,16 @@ from pdf.forms import (
 from pdf.models.shared_pdf_models import SharedPdf
 from pdf.services.pdf_services import check_object_access_allowed
 from pdf.services.shared_pdf_services import (
+    EXPIRATION_FILTER_VALUES,
     check_shared_access_allowed,
     check_shared_access_allowed_by_identifier,
+    construct_shared_query_overview_url,
     get_future_datetime,
 )
 from pdf.services.workspace_services import get_shared_pdfs_of_workspace
 from pdf.views.pdf_views import PdfMixin
 from qrcode.image import svg
+from rapidfuzz import fuzz, utils
 from users.service import get_viewer_theme_and_color
 
 
@@ -124,26 +127,93 @@ class OverviewMixin(BaseShareMixin):
 
         return sorting_dict[profile.shared_pdf_sorting]
 
-    @staticmethod
-    def filter_objects(request: HttpRequest) -> QuerySet:
+    @classmethod
+    def filter_objects(cls, request: HttpRequest) -> QuerySet:
         """
-        Filter the shared PDFs when performing a search in the overview. As there is no search functionality, this is
-        just a dummy function
+        Filter the shared PDFs of the current collection(s) for the overview. Supports a combinable text search (over
+        the shared name and the original PDF name) together with status filters for the expiration and password state.
+        Deleted shared PDFs are always hidden.
         """
 
-        shared_pdfs = request.user.profile.current_shared_pdfs
+        shared_pdfs = request.user.profile.current_shared_pdfs.select_related('pdf')
+
+        # deleted shared PDFs are never shown in the overview
         shared_pdfs = shared_pdfs.filter(
             Q(deletion_date__isnull=True) | Q(deletion_date__gt=datetime.now(timezone.utc))
         )
 
+        # filter by expiration status (active = still usable, expired = inactive due to date or max views)
+        expiration = request.GET.get('expiration', '')
+        if expiration in EXPIRATION_FILTER_VALUES:
+            inactive_q = cls.get_inactive_q()
+            if expiration == 'expired':
+                shared_pdfs = shared_pdfs.filter(inactive_q)
+            else:
+                shared_pdfs = shared_pdfs.exclude(inactive_q)
+
+        # filter by password status
+        password = request.GET.get('password', '')
+        no_password_q = Q(password__isnull=True) | Q(password='')  # nosec B106
+        if password == 'yes':  # nosec B105
+            shared_pdfs = shared_pdfs.exclude(no_password_q)
+        elif password == 'no':  # nosec B105
+            shared_pdfs = shared_pdfs.filter(no_password_q)
+
+        search = request.GET.get('search', '')
+        if search:
+            shared_pdfs = cls.fuzzy_filter_shared_pdfs(shared_pdfs, search)
+
         return shared_pdfs
 
     @staticmethod
-    def get_extra_context(request: HttpRequest) -> dict:  # pragma: no cover
+    def get_inactive_q() -> Q:
+        """
+        Build a Q object matching inactive shared PDFs. This mirrors the 'inactive' property of the SharedPdf model: a
+        shared PDF is inactive once its expiration date has passed or its maximum number of views has been reached.
+        """
+
+        now = datetime.now(timezone.utc)
+
+        return Q(expiration_date__isnull=False, expiration_date__lte=now) | Q(
+            max_views__isnull=False, views__gte=F('max_views')
+        )
+
+    @staticmethod
+    def fuzzy_filter_shared_pdfs(shared_pdfs: QuerySet, search: str) -> QuerySet:
+        """
+        Filter the shared PDFs by a search term. A shared PDF matches if the term is contained in (or fuzzily matches)
+        either its shared name or the name of the original PDF. The substring check keeps the search predictable while
+        the fuzzy matching adds tolerance for typos, consistent with the PDF overview search.
+        """
+
+        fuzzy_result = []
+        normalized_search = search.lower()
+
+        for shared_pdf in shared_pdfs:
+            for candidate in (shared_pdf.name, shared_pdf.pdf.name):
+                if normalized_search in candidate.lower():
+                    fuzzy_result.append(shared_pdf.id)
+                    break
+
+                w_ratio = fuzz.WRatio(search, candidate, processor=utils.default_process)
+                partial_ratio = fuzz.partial_ratio(search, candidate, processor=utils.default_process)
+
+                # better to be a bit more strict regarding this so we avoid false positives
+                if (w_ratio + partial_ratio) / 2 > 85 or partial_ratio > 95:
+                    fuzzy_result.append(shared_pdf.id)
+                    break
+
+        return shared_pdfs.filter(id__in=fuzzy_result)
+
+    @staticmethod
+    def get_extra_context(request: HttpRequest) -> dict:
         """get further information that needs to be passed to the template."""
 
         return {
             'page': 'shared_pdf_overview',
+            'search_query': request.GET.get('search', ''),
+            'expiration_filter': request.GET.get('expiration', ''),
+            'password_filter': request.GET.get('password', ''),
             'current_collection_id': request.user.profile.current_collection_id,
             'current_collection_name': request.user.profile.current_collection_name,
             'current_workspace_id': request.user.profile.current_workspace_id,
@@ -256,8 +326,23 @@ class Overview(OverviewMixin, base_views.BaseOverview):
     """
 
 
-class OverviewQuery(BaseShareMixin, base_views.BaseOverviewQuery):
-    """View for performing searches and sorting on the shared PDF overview page."""
+class OverviewQuery(BaseShareMixin, View):
+    """
+    View for performing combinable searches and status filtering on the shared PDF overview page. The text search and
+    the expiration/password status filters can be changed independently and are merged with the already active filters.
+    """
+
+    def get(self, request: HttpRequest):
+        referer_url = request.META.get('HTTP_REFERER', 'shared_pdf_overview')
+
+        redirect_url = construct_shared_query_overview_url(
+            referer_url,
+            request.GET.get('search'),
+            request.GET.get('expiration'),
+            request.GET.get('password'),
+        )
+
+        return redirect(redirect_url)
 
 
 class Delete(SharedPdfMixin, base_views.BaseDelete):

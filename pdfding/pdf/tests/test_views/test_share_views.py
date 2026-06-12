@@ -120,19 +120,113 @@ class TestOverviewMixin(TestCase):
         deletion_date = datetime.now(timezone.utc) - timedelta(minutes=5)
         SharedPdf.objects.create(pdf=self.pdf, name='shared_deleted', deletion_date=deletion_date)
 
-    def test_filter_objects(self):
-        self.client.login(username=self.username, password=self.password)
-        response = self.client.get(f'{reverse('shared_pdf_overview')}?q=pdf_2+%23tag_2')
+    def get_request(self, **params):
+        """Log in and return a request whose GET data contains the provided query parameters."""
 
-        # make sure only current shared pdfs are userd
+        self.client.login(username=self.username, password=self.password)
+
+        return self.client.get(reverse('shared_pdf_overview'), params).wsgi_request
+
+    def test_filter_objects(self):
+        # shared PDFs of other workspaces and deleted shared PDFs are never returned
         other_ws = create_workspace('other_ws', creator=self.user)
         other_ws_pdf = Pdf.objects.create(collection=other_ws.collections[0], name='other_ws_pdf')
         SharedPdf.objects.create(pdf=other_ws_pdf, name='other_share')
 
-        filtered_shares = OverviewMixin.filter_objects(response.wsgi_request)
-        shared_names = [shared.name for shared in filtered_shares]
+        filtered_shares = OverviewMixin.filter_objects(self.get_request())
 
-        self.assertEqual(shared_names, ['shared_1', 'shared_2', 'shared_3'])
+        self.assertEqual([shared.name for shared in filtered_shares], ['shared_1', 'shared_2', 'shared_3'])
+
+    def test_filter_objects_search_by_shared_name(self):
+        report_pdf = Pdf.objects.create(collection=self.user.profile.current_collection, name='annual_report')
+        SharedPdf.objects.create(pdf=report_pdf, name='quarterly link')
+
+        filtered_shares = OverviewMixin.filter_objects(self.get_request(search='quarterly'))
+
+        self.assertEqual([shared.name for shared in filtered_shares], ['quarterly link'])
+
+    def test_filter_objects_search_by_pdf_name(self):
+        report_pdf = Pdf.objects.create(collection=self.user.profile.current_collection, name='annual_report')
+        SharedPdf.objects.create(pdf=report_pdf, name='quarterly link')
+
+        # 'annual' only matches the name of the original PDF, not the shared name
+        filtered_shares = OverviewMixin.filter_objects(self.get_request(search='annual'))
+
+        self.assertEqual([shared.name for shared in filtered_shares], ['quarterly link'])
+
+    def test_filter_objects_expiration(self):
+        SharedPdf.objects.create(
+            pdf=self.pdf, name='expired_date', expiration_date=datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        SharedPdf.objects.create(pdf=self.pdf, name='expired_views', views=5, max_views=3)
+
+        expired = OverviewMixin.filter_objects(self.get_request(expiration='expired'))
+        self.assertEqual(sorted(shared.name for shared in expired), ['expired_date', 'expired_views'])
+
+        active = OverviewMixin.filter_objects(self.get_request(expiration='active'))
+        self.assertEqual(sorted(shared.name for shared in active), ['shared_1', 'shared_2', 'shared_3'])
+
+    def test_filter_objects_password(self):
+        SharedPdf.objects.create(pdf=self.pdf, name='protected', password=make_password('pw'))
+        SharedPdf.objects.create(pdf=self.pdf, name='empty_pw', password='')
+
+        with_password = OverviewMixin.filter_objects(self.get_request(password='yes'))
+        self.assertEqual([shared.name for shared in with_password], ['protected'])
+
+        without_password = OverviewMixin.filter_objects(self.get_request(password='no'))
+        self.assertEqual(
+            sorted(shared.name for shared in without_password), ['empty_pw', 'shared_1', 'shared_2', 'shared_3']
+        )
+
+    def test_filter_objects_combined(self):
+        special_pdf = Pdf.objects.create(collection=self.user.profile.current_collection, name='special_pdf')
+        SharedPdf.objects.create(
+            pdf=special_pdf,
+            name='special share',
+            password=make_password('pw'),
+            expiration_date=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        # decoys on the same PDF that each fail exactly one of the three conditions
+        SharedPdf.objects.create(pdf=special_pdf, name='special share active', password=make_password('pw'))
+        SharedPdf.objects.create(
+            pdf=special_pdf,
+            name='special share no pw',
+            expiration_date=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+
+        request = self.get_request(search='special', expiration='expired', password='yes')
+        filtered_shares = OverviewMixin.filter_objects(request)
+
+        self.assertEqual([shared.name for shared in filtered_shares], ['special share'])
+
+    def test_fuzzy_filter_shared_pdfs(self):
+        SharedPdf.objects.create(pdf=self.pdf, name='self hosted bookmarks')
+        SharedPdf.objects.create(pdf=self.pdf, name='The best self-hosted applications ')
+        hosting_pdf = Pdf.objects.create(collection=self.user.profile.current_collection, name='Self-hosting Guide')
+        SharedPdf.objects.create(pdf=hosting_pdf, name='unrelated name')
+        SharedPdf.objects.create(pdf=self.pdf, name='completely different')
+
+        result = OverviewMixin.fuzzy_filter_shared_pdfs(SharedPdf.objects.all(), 'self hosted')
+
+        self.assertEqual(
+            sorted(shared.name for shared in result),
+            ['The best self-hosted applications ', 'self hosted bookmarks', 'unrelated name'],
+        )
+
+    def test_overview_renders_with_filters(self):
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.get(
+            reverse('shared_pdf_overview'), {'search': 'shared', 'expiration': 'active', 'password': 'no'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, 'shared_pdf_overview.html')
+        # active shares without a password matching the search are shown
+        self.assertContains(response, 'shared_1')
+        # the active-filter chips are rendered
+        self.assertContains(response, 'id="search_filter"')
+        self.assertContains(response, 'id="expiration_filter"')
+        self.assertContains(response, 'id="password_filter"')
 
     def test_get_extra_context(self):
         self.client.login(username=self.username, password=self.password)
@@ -141,12 +235,52 @@ class TestOverviewMixin(TestCase):
         generated_extra_context = share_views.OverviewMixin.get_extra_context(response.wsgi_request)
         expected_extra_context = {
             'page': 'shared_pdf_overview',
+            'search_query': '',
+            'expiration_filter': '',
+            'password_filter': '',
             'current_collection_id': str(self.user.id),
             'current_collection_name': 'Default',
             'current_workspace_id': str(self.user.id),
         }
 
         self.assertEqual(generated_extra_context, expected_extra_context)
+
+
+class TestOverviewQuery(TestCase):
+    username = 'user'
+    password = '12345'
+
+    def setUp(self):
+        self.user = None
+        self.pdf = None
+        set_up(self)
+        self.client.login(username=self.username, password=self.password)
+
+    def test_query_search(self):
+        response = self.client.get(
+            reverse('shared_pdf_overview_query'),
+            {'search': 'foo'},
+            HTTP_REFERER=reverse('shared_pdf_overview'),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, f"{reverse('shared_pdf_overview')}?search=foo")
+
+    def test_query_status_filters_combine(self):
+        # the existing search in the referer is kept when a status filter is changed
+        referer = f"{reverse('shared_pdf_overview')}?search=foo"
+        response = self.client.get(
+            reverse('shared_pdf_overview_query'), {'expiration': 'expired'}, HTTP_REFERER=referer
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, f"{reverse('shared_pdf_overview')}?search=foo&expiration=expired")
+
+    def test_query_no_referer(self):
+        response = self.client.get(reverse('shared_pdf_overview_query'), {'password': 'yes'})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, f"{reverse('shared_pdf_overview')}?password=yes")
 
 
 class TestSharedPdfMixin(TestCase):
