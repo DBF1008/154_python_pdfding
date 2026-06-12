@@ -1,7 +1,7 @@
 import re
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from logging import getLogger
 from math import floor
@@ -35,6 +35,66 @@ from users.models import Profile
 import json
 
 logger = getLogger(__file__)
+
+# Regex for PDF date format: YYYYMMDDHHmmSS with optional timezone (Z, +HH'mm', -HH'mm')
+_PDF_DATE_RE = re.compile(
+    r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})"
+    r"(?:([Z+\-])(?:(\d{2})'?(\d{2})'?)?)?"
+)
+
+
+def parse_pdf_date(annotation_object: dict, fallback_date: datetime) -> datetime:
+    """
+    Robustly parse a PDF annotation date from /CreationDate or /M.
+
+    Handles the standard PDF date formats:
+      - D:YYYYMMDDHHmmSS
+      - D:YYYYMMDDHHmmSSZ
+      - D:YYYYMMDDHHmmSS+HH'mm'
+      - D:YYYYMMDDHHmmSS-HH'mm'
+      - variants with missing trailing quote or no minutes
+
+    Returns fallback_date when the field is missing, not a string, or
+    cannot be parsed.
+    """
+
+    date_str = annotation_object.get("/CreationDate")
+    if not date_str:
+        date_str = annotation_object.get("/M")
+
+    if not date_str or not isinstance(date_str, str):
+        return fallback_date
+
+    # Strip the standard "D:" prefix if present
+    if date_str.startswith("D:"):
+        date_str = date_str[2:]
+
+    match = _PDF_DATE_RE.match(date_str)
+    if not match:
+        return fallback_date
+
+    try:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        hour = int(match.group(4))
+        minute = int(match.group(5))
+        second = int(match.group(6))
+
+        tz_sign = match.group(7)
+        if tz_sign is None or tz_sign == 'Z':
+            tz = timezone.utc
+        else:
+            offset_hours = int(match.group(8) or 0)
+            offset_minutes = int(match.group(9) or 0)
+            offset_seconds = (offset_hours * 60 + offset_minutes) * 60
+            if tz_sign == '-':
+                offset_seconds = -offset_seconds
+            tz = timezone(timedelta(seconds=offset_seconds))
+
+        return datetime(year, month, day, hour, minute, second, tzinfo=tz)
+    except (ValueError, TypeError, OverflowError):
+        return fallback_date
 
 
 class PdfProcessingServices:
@@ -156,6 +216,10 @@ class PdfProcessingServices:
         We need to have pdf_highlight_class and pdf_comment_class arguments so that the migration using this function
         can overwrite the classes with the model 'blueprints' we get via
         apps.get_model(("pdf", "PdfHighlight/PdfComment")) results. Without this the migrations will not work.
+
+        Annotations with missing or non-standard dates are still extracted using a fallback date.
+        Each annotation is processed independently so that a single malformed annotation does not
+        prevent the remaining annotations from being stored.
         """
 
         try:
@@ -166,38 +230,54 @@ class PdfProcessingServices:
             pypdf_pdf = PdfReader(pdf.file)
             pyreadium_pdf = PdfDocument(pdf.file, autoclose=True)
 
+            # fallback date used when an annotation has no parseable date
+            fallback_date = pdf.creation_date if pdf.creation_date else datetime.now(timezone.utc)
+
             for i, pypdf_page in enumerate(pypdf_pdf.pages):
                 pdfium_page = pyreadium_pdf[i]
 
-                if "/Annots" in pypdf_page:
+                if "/Annots" not in pypdf_page:
+                    continue
+
+                for annotation in pypdf_page["/Annots"]:
                     try:
-                        for annotation in pypdf_page["/Annots"]:
-                            annotation_object = annotation.get_object()
+                        annotation_object = annotation.get_object()
+                        annotation_type = annotation_object.get("/Subtype")
 
-                            annotation_type = annotation_object["/Subtype"]
+                        if annotation_type not in ["/FreeText", "/Highlight"]:
+                            continue
 
-                            if annotation_type in ["/FreeText", "/Highlight"]:
-                                date_time_string = f'{annotation_object["/CreationDate"].split(':')[-1]}-+00:00'
-                                creation_date = datetime.strptime(date_time_string, '%Y%m%d%H%M%S-%z')
+                        creation_date = parse_pdf_date(annotation_object, fallback_date)
 
-                                if annotation_type == "/FreeText":
-                                    comment_text = annotation_object["/Contents"]
-                                    pdf_comment_class.objects.create(
-                                        text=comment_text, page=i + 1, creation_date=creation_date, pdf=pdf
-                                    )
+                        if annotation_type == "/FreeText":
+                            comment_text = annotation_object.get("/Contents", "")
+                            if not comment_text or not str(comment_text).strip():
+                                continue
 
-                                elif annotation_type == "/Highlight":
-                                    highlight_text = cls.extract_pdf_highlight_text(annotation_object, pdfium_page)
-                                    pdf_highlight_class.objects.create(
-                                        text=highlight_text, page=i + 1, creation_date=creation_date, pdf=pdf
-                                    )
-                    except Exception as e:  # nosec # noqa # pragma: no cover
+                            pdf_comment_class.objects.create(
+                                text=str(comment_text), page=i + 1, creation_date=creation_date, pdf=pdf
+                            )
+
+                        elif annotation_type == "/Highlight":
+                            if "/QuadPoints" not in annotation_object:
+                                continue
+
+                            highlight_text = cls.extract_pdf_highlight_text(annotation_object, pdfium_page)
+                            if not highlight_text or not highlight_text.strip():
+                                continue
+
+                            pdf_highlight_class.objects.create(
+                                text=highlight_text, page=i + 1, creation_date=creation_date, pdf=pdf
+                            )
+                    except Exception as e:  # nosec # noqa
                         workspace_id = pdf.collection.workspace.id
 
                         logger.info(
-                            f'Could not extract highlights and comments for "{pdf.name}" of workspace "{workspace_id}"'
+                            f'Could not extract annotation for "{pdf.name}" of workspace "{workspace_id}"'
+                            f' on page {i + 1}'
                         )
                         logger.info(traceback.format_exc())
+                        continue
 
             pyreadium_pdf.close()
 

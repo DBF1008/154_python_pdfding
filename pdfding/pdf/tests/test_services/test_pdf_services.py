@@ -1,5 +1,5 @@
 import filecmp
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -13,6 +13,7 @@ from django.http.response import Http404
 from django.test import TestCase
 from django.urls import reverse
 from pdf.models.pdf_models import Pdf, PdfComment, PdfHighlight
+from pdf.services.pdf_services import parse_pdf_date
 from PIL import Image
 from pypdfium2 import PdfDocument
 from users.service import get_demo_pdf
@@ -335,6 +336,471 @@ class TestPdfProcessingServices(TestCase):
         # check that blocks are not called as the file path did not change
         mock_copy.assert_not_called()
         mock_delete_empty_dirs_after_rename_or_delete.assert_not_called()
+
+
+class TestParsePdfDate(TestCase):
+    """Regression tests for the parse_pdf_date helper."""
+
+    def setUp(self):
+        self.fallback = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    def test_standard_date_no_timezone(self):
+        """D:YYYYMMDDHHmmSS without timezone should parse as UTC."""
+        annotation = {"/CreationDate": "D:20250311081649"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.month, 3)
+        self.assertEqual(result.day, 11)
+        self.assertEqual(result.hour, 8)
+        self.assertEqual(result.minute, 16)
+        self.assertEqual(result.second, 49)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_date_with_z_suffix(self):
+        """D:YYYYMMDDHHmmSSZ should parse as UTC."""
+        annotation = {"/CreationDate": "D:20250311081649Z"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_date_with_positive_timezone(self):
+        """D:YYYYMMDDHHmmSS+HH'mm' should parse with correct offset."""
+        annotation = {"/CreationDate": "D:20250311081649+05'30'"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.month, 3)
+        self.assertEqual(result.day, 11)
+        expected_tz = timezone(timedelta(hours=5, minutes=30))
+        self.assertEqual(result.tzinfo, expected_tz)
+
+    def test_date_with_negative_timezone(self):
+        """D:YYYYMMDDHHmmSS-HH'mm' should parse with correct negative offset."""
+        annotation = {"/CreationDate": "D:20250311081649-08'00'"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        expected_tz = timezone(timedelta(hours=-8))
+        self.assertEqual(result.tzinfo, expected_tz)
+
+    def test_date_without_d_prefix(self):
+        """A date string without D: prefix should still parse."""
+        annotation = {"/CreationDate": "20250311081649"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.month, 3)
+
+    def test_date_missing_trailing_quote(self):
+        """D:YYYYMMDDHHmmSS+HH'mm (missing trailing quote) should still parse."""
+        annotation = {"/CreationDate": "D:20250311081649+05'30"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        expected_tz = timezone(timedelta(hours=5, minutes=30))
+        self.assertEqual(result.tzinfo, expected_tz)
+
+    def test_missing_creation_date_returns_fallback(self):
+        """Missing /CreationDate should return the fallback date."""
+        annotation = {}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+    def test_missing_creation_date_uses_m_field(self):
+        """When /CreationDate is missing, /M should be used as fallback."""
+        annotation = {"/M": "D:20250601120000"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.month, 6)
+        self.assertEqual(result.day, 1)
+
+    def test_invalid_date_string_returns_fallback(self):
+        """A completely invalid date string should return the fallback."""
+        annotation = {"/CreationDate": "not-a-date"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+    def test_empty_string_returns_fallback(self):
+        """An empty /CreationDate string should return the fallback."""
+        annotation = {"/CreationDate": ""}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+    def test_none_value_returns_fallback(self):
+        """A None /CreationDate value should return the fallback."""
+        annotation = {"/CreationDate": None}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+    def test_non_string_value_returns_fallback(self):
+        """A non-string /CreationDate value should return the fallback."""
+        annotation = {"/CreationDate": 12345}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+    def test_invalid_month_returns_fallback(self):
+        """A date with an invalid month (13) should return the fallback."""
+        annotation = {"/CreationDate": "D:20251311081649"}
+        result = parse_pdf_date(annotation, self.fallback)
+
+        self.assertEqual(result, self.fallback)
+
+
+class TestSetHighlightsAndCommentsResilience(TestCase):
+    """Regression tests ensuring annotation extraction is resilient to bad data."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='username', password='password', email='a@a.com')
+
+    def _make_annotation_mock(self, subtype, creation_date=None, contents=None, quad_points=None):
+        """Create a mock annotation object as returned by pypdf."""
+        obj = mock.MagicMock()
+        obj_dict = {"/Subtype": subtype}
+        if creation_date is not None:
+            obj_dict["/CreationDate"] = creation_date
+        if contents is not None:
+            obj_dict["/Contents"] = contents
+        if quad_points is not None:
+            obj_dict["/QuadPoints"] = quad_points
+
+        obj.get_object.return_value = obj_dict
+
+        # make dict-like access work for annotation_object.get(key) and "key" in annotation_object
+        obj_dict_get = {k: v for k, v in obj_dict.items()}
+
+        class FakeAnnotationObject(dict):
+            def get(self, key, default=None):
+                return obj_dict_get.get(key, default)
+
+        fake_obj = FakeAnnotationObject(obj_dict_get)
+        obj.get_object.return_value = fake_obj
+
+        return obj
+
+    def _make_page_mock(self, annotations):
+        """Create a mock pypdf page with the given annotations."""
+        page = mock.MagicMock()
+        page.__contains__ = mock.MagicMock(return_value=bool(annotations))
+        page.__getitem__ = mock.MagicMock(return_value=annotations)
+        return page
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_missing_creation_date_uses_fallback(self, mock_reader_class, mock_document_class):
+        """Annotations without /CreationDate should use the pdf creation_date as fallback."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        # Create a FreeText annotation without /CreationDate
+        comment_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date=None,
+            contents="A comment without date",
+        )
+
+        mock_page = self._make_page_mock([comment_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "A comment without date")
+        self.assertEqual(comments[0].page, 1)
+        # creation_date should be the fallback (pdf.creation_date)
+        self.assertEqual(comments[0].creation_date, pdf.creation_date)
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_invalid_date_does_not_skip_other_annotations(self, mock_reader_class, mock_document_class):
+        """An annotation with an invalid date should not prevent other annotations from being stored."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        # First annotation: FreeText with invalid date
+        bad_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="totally-invalid-date",
+            contents="Bad date comment",
+        )
+        # Second annotation: FreeText with valid date
+        good_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Good date comment",
+        )
+
+        mock_page = self._make_page_mock([bad_annot, good_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all().order_by('text'))
+        # Both annotations should be stored despite the first having an invalid date
+        self.assertEqual(len(comments), 2)
+        texts = [c.text for c in comments]
+        self.assertIn("Bad date comment", texts)
+        self.assertIn("Good date comment", texts)
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_bad_annotation_on_page_does_not_skip_rest_of_page(self, mock_reader_class, mock_document_class):
+        """A failing annotation should not prevent subsequent annotations on the same page."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        # First annotation: will raise during get_object()
+        bad_annot = mock.MagicMock()
+        bad_annot.get_object.side_effect = RuntimeError("corrupt annotation")
+
+        # Second annotation: valid FreeText
+        good_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Valid comment after bad one",
+        )
+
+        mock_page = self._make_page_mock([bad_annot, good_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "Valid comment after bad one")
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_empty_contents_skipped(self, mock_reader_class, mock_document_class):
+        """FreeText annotations with empty /Contents should be skipped."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        empty_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="",
+        )
+        valid_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Valid comment",
+        )
+
+        mock_page = self._make_page_mock([empty_annot, valid_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "Valid comment")
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_unknown_subtype_skipped(self, mock_reader_class, mock_document_class):
+        """Annotations with unknown /Subtype should be skipped without error."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        link_annot = self._make_annotation_mock(
+            subtype="/Link",
+            creation_date="D:20250311081649",
+        )
+        valid_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Valid comment",
+        )
+
+        mock_page = self._make_page_mock([link_annot, valid_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "Valid comment")
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_stability_across_multiple_calls(self, mock_reader_class, mock_document_class):
+        """Page numbers, text, and dates should remain stable across multiple calls."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        comment_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Stable comment",
+        )
+
+        mock_page = self._make_page_mock([comment_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        # First call
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+        first_comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(first_comments), 1)
+        first_text = first_comments[0].text
+        first_page = first_comments[0].page
+        first_date = first_comments[0].creation_date
+
+        # Second call
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+        second_comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(second_comments), 1)
+        self.assertEqual(second_comments[0].text, first_text)
+        self.assertEqual(second_comments[0].page, first_page)
+        self.assertEqual(second_comments[0].creation_date, first_date)
+
+        # Third call
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+        third_comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(third_comments), 1)
+        self.assertEqual(third_comments[0].text, first_text)
+        self.assertEqual(third_comments[0].page, first_page)
+        self.assertEqual(third_comments[0].creation_date, first_date)
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_mixed_highlights_and_comments_with_bad_dates(self, mock_reader_class, mock_document_class):
+        """Mixed highlights and comments with various date issues should all be extracted."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        # Comment with no date
+        comment_no_date = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date=None,
+            contents="Comment no date",
+        )
+        # Comment with valid date
+        comment_valid = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649",
+            contents="Comment valid date",
+        )
+        # Comment with invalid date
+        comment_bad_date = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="garbage",
+            contents="Comment bad date",
+        )
+
+        mock_page = self._make_page_mock([comment_no_date, comment_valid, comment_bad_date])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all().order_by('text'))
+        self.assertEqual(len(comments), 3)
+        texts = [c.text for c in comments]
+        self.assertIn("Comment no date", texts)
+        self.assertIn("Comment valid date", texts)
+        self.assertIn("Comment bad date", texts)
+
+        # All should have page=1
+        for c in comments:
+            self.assertEqual(c.page, 1)
+
+    @mock.patch('pdf.services.pdf_services.PdfDocument')
+    @mock.patch('pdf.services.pdf_services.PdfReader')
+    def test_date_with_timezone_offset_preserved(self, mock_reader_class, mock_document_class):
+        """Annotations with timezone offsets should have the offset preserved (converted to UTC by Django)."""
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='test_pdf',
+            file='dummy.pdf',
+        )
+
+        # Comment with +05:30 timezone
+        comment_annot = self._make_annotation_mock(
+            subtype="/FreeText",
+            creation_date="D:20250311081649+05'30'",
+            contents="Timezone comment",
+        )
+
+        mock_page = self._make_page_mock([comment_annot])
+        mock_reader = mock.MagicMock()
+        mock_reader.pages = [mock_page]
+        mock_reader_class.return_value = mock_reader
+
+        mock_pdfium_doc = mock.MagicMock()
+        mock_document_class.return_value = mock_pdfium_doc
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        comments = list(pdf.pdfcomment_set.all())
+        self.assertEqual(len(comments), 1)
+
+        # Django stores datetimes in UTC, so 08:16:49+05:30 becomes 02:46:49 UTC
+        expected_utc = datetime(2025, 3, 11, 2, 46, 49, tzinfo=timezone.utc)
+        self.assertEqual(comments[0].creation_date, expected_utc)
 
 
 class TestOtherServices(TestCase):
