@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 from backup import service
+from cryptography.fernet import Fernet
 from django.test import TestCase
 
 
@@ -64,3 +65,83 @@ class TestEncryption(TestCase):
         tmp_file_path.unlink()
 
         self.assertEqual(tmp_file_contents, b'"""some content for encryption test"""\ndecrypted')
+
+
+class TestRecoveryHelpers(TestCase):
+    @staticmethod
+    def write_tmp(data: bytes) -> Path:
+        tmp_path = Path(__file__).parent / 'tmp_recovery'
+        with open(tmp_path, 'wb') as tmp_file:
+            tmp_file.write(data)
+
+        return tmp_path
+
+    def test_looks_like_fernet_token_true(self):
+        token = Fernet(Fernet.generate_key()).encrypt(b'some secret content')
+
+        self.assertTrue(service.looks_like_fernet_token(token))
+
+    def test_looks_like_fernet_token_false(self):
+        # not valid base64 / not a token structure
+        self.assertFalse(service.looks_like_fernet_token(b'%PDF-1.7 not a token'))
+        self.assertFalse(service.looks_like_fernet_token(service.SQLITE_HEADER + b'rest of the db'))
+
+    def test_verify_sqlite_file_true(self):
+        tmp_path = self.write_tmp(service.SQLITE_HEADER + b'rest of a sqlite database')
+
+        try:
+            self.assertTrue(service.verify_sqlite_file(tmp_path))
+        finally:
+            tmp_path.unlink()
+
+    def test_verify_sqlite_file_false(self):
+        tmp_path = self.write_tmp(b'this is not a sqlite database')
+
+        try:
+            self.assertFalse(service.verify_sqlite_file(tmp_path))
+        finally:
+            tmp_path.unlink()
+
+    def test_detect_and_validate_encryption_plaintext(self):
+        tmp_path = self.write_tmp(b'%PDF-1.7 plaintext backup')
+
+        try:
+            self.assertEqual(service.detect_and_validate_encryption(tmp_path, None), 'plaintext')
+        finally:
+            tmp_path.unlink()
+
+    def test_detect_and_validate_encryption_encrypted(self):
+        key = Fernet.generate_key()
+        tmp_path = self.write_tmp(Fernet(key).encrypt(b'encrypted backup'))
+
+        try:
+            self.assertEqual(service.detect_and_validate_encryption(tmp_path, key), 'encrypted')
+        finally:
+            tmp_path.unlink()
+
+    def test_detect_and_validate_encryption_wrong_key(self):
+        tmp_path = self.write_tmp(Fernet(Fernet.generate_key()).encrypt(b'encrypted backup'))
+
+        try:
+            with self.assertRaises(service.RecoveryPreflightError):
+                service.detect_and_validate_encryption(tmp_path, Fernet.generate_key())
+        finally:
+            tmp_path.unlink()
+
+    def test_detect_and_validate_encryption_enabled_but_plaintext(self):
+        tmp_path = self.write_tmp(b'%PDF-1.7 plaintext backup, not a token')
+
+        try:
+            with self.assertRaises(service.RecoveryPreflightError):
+                service.detect_and_validate_encryption(tmp_path, Fernet.generate_key())
+        finally:
+            tmp_path.unlink()
+
+    def test_detect_and_validate_encryption_disabled_but_encrypted(self):
+        tmp_path = self.write_tmp(Fernet(Fernet.generate_key()).encrypt(b'encrypted backup'))
+
+        try:
+            with self.assertRaises(service.RecoveryPreflightError):
+                service.detect_and_validate_encryption(tmp_path, None)
+        finally:
+            tmp_path.unlink()
