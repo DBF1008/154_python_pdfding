@@ -1,5 +1,6 @@
 import filecmp
-from datetime import datetime
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -14,8 +15,43 @@ from django.test import TestCase
 from django.urls import reverse
 from pdf.models.pdf_models import Pdf, PdfComment, PdfHighlight
 from PIL import Image
+from pypdf import PdfReader, PdfWriter
 from pypdfium2 import PdfDocument
 from users.service import get_demo_pdf
+
+
+def build_demo_pdf_with_modified_annotations(mutate_annotation, name='modified_demo.pdf') -> File:
+    """
+    Build a Django File from the demo pdf, applying ``mutate_annotation`` to every comment/highlight annotation.
+
+    This is used to craft annotated pdfs whose annotations have missing or malformed timestamps (or other broken
+    fields) while keeping the rest of the demo pdf - including the text the highlights point at - intact.
+    """
+
+    reader = PdfReader(BytesIO(get_demo_pdf().read()))
+    writer = PdfWriter(clone_from=reader)
+
+    for page in writer.pages:
+        if '/Annots' not in page:
+            continue
+        for annotation in page['/Annots']:
+            annotation_object = annotation.get_object()
+            if annotation_object.get('/Subtype') in ('/FreeText', '/Highlight'):
+                mutate_annotation(annotation_object)
+
+    buffer = BytesIO()
+    writer.write(buffer)
+    buffer.seek(0)
+
+    return File(file=buffer, name=name)
+
+
+def remove_annotation_dates(annotation_object) -> None:
+    """Remove both timestamp keys of an annotation so it has no standard creation/modification date."""
+
+    for date_key in ('/CreationDate', '/ModDate'):
+        if date_key in annotation_object:
+            del annotation_object[date_key]
 
 
 class TestPdfProcessingServices(TestCase):
@@ -192,6 +228,133 @@ class TestPdfProcessingServices(TestCase):
 
         self.assertFalse(pdf.pdfcomment_set.count())
         self.assertFalse(pdf.pdfhighlight_set.count())
+
+    def test_parse_pdf_date(self):
+        parse_pdf_date = service.PdfProcessingServices.parse_pdf_date
+
+        # timezone-less and "Z" values are treated as UTC (this matches the pre-existing annotations)
+        self.assertEqual(parse_pdf_date('D:20250311081649'), datetime(2025, 3, 11, 8, 16, 49, tzinfo=timezone.utc))
+        self.assertEqual(parse_pdf_date('20250311081649'), datetime(2025, 3, 11, 8, 16, 49, tzinfo=timezone.utc))
+        self.assertEqual(parse_pdf_date('D:20250311081649Z'), datetime(2025, 3, 11, 8, 16, 49, tzinfo=timezone.utc))
+
+        # explicit timezone offsets are normalized to UTC
+        self.assertEqual(
+            parse_pdf_date("D:20250311081649+05'30'"), datetime(2025, 3, 11, 2, 46, 49, tzinfo=timezone.utc)
+        )
+        self.assertEqual(
+            parse_pdf_date("D:20250311081649-08'00'"), datetime(2025, 3, 11, 16, 16, 49, tzinfo=timezone.utc)
+        )
+
+        # truncated values are still parsed instead of failing
+        self.assertEqual(parse_pdf_date('D:202503'), datetime(2025, 3, 1, 0, 0, 0, tzinfo=timezone.utc))
+
+        # missing or malformed values return None so the caller can fall back to another timestamp
+        for invalid_date in [None, '', 'garbage', 'D:', 'D:20251301081649']:
+            self.assertIsNone(parse_pdf_date(invalid_date))
+
+    def test_set_highlights_and_comments_keeps_annotations_without_timestamps(self):
+        # an annotated pdf where no comment/highlight has a standard timestamp used to be skipped entirely
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='pdf_without_timestamps',
+            file=build_demo_pdf_with_modified_annotations(remove_annotation_dates, 'no_dates.pdf'),
+        )
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        # all recognizable annotations are still stored
+        self.assertEqual(pdf.pdfcomment_set.count(), 2)
+        self.assertEqual(pdf.pdfhighlight_set.count(), 2)
+
+        # page and text are extracted exactly as for an annotation with a timestamp
+        self.assertEqual(
+            sorted(comment.text for comment in pdf.pdfcomment_set.all()), ['demo comment page 2', 'last page']
+        )
+        self.assertEqual(sorted(comment.page for comment in pdf.pdfcomment_set.all()), [2, 5])
+        self.assertEqual(
+            sorted(highlight.text for highlight in pdf.pdfhighlight_set.all()),
+            [
+                'Massa ullamcorper aenean molestie laoreet aenean sed laoreet. '
+                'Ante non cursus proin mauris dictumst magnis',
+                'Semper curabitur est maecenas orci dis accumsan sem dictum commodo?',
+            ],
+        )
+
+        # the missing timestamp deterministically falls back to the pdf creation date
+        for annotation in [*pdf.pdfcomment_set.all(), *pdf.pdfhighlight_set.all()]:
+            self.assertEqual(annotation.creation_date, pdf.creation_date)
+
+    def test_set_highlights_and_comments_stable_across_reruns(self):
+        # mixed pdf: keep one valid timestamp, drop the timestamps of all other annotations
+        def remove_dates_except_first_comment(annotation_object):
+            if annotation_object.get('/Contents') == 'demo comment page 2':
+                return
+            remove_annotation_dates(annotation_object)
+
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='pdf_stable_annotations',
+            file=build_demo_pdf_with_modified_annotations(remove_dates_except_first_comment, 'stable.pdf'),
+        )
+
+        def extract_annotation_state():
+            return sorted(
+                (annotation.page, annotation.text, annotation.creation_date)
+                for annotation in [*pdf.pdfcomment_set.all(), *pdf.pdfhighlight_set.all()]
+            )
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+        first_run = extract_annotation_state()
+
+        # the valid timestamp is parsed from the pdf, not replaced by the fallback
+        self.assertIn(
+            (2, 'demo comment page 2', datetime(2025, 3, 11, 8, 16, 49, tzinfo=timezone.utc)), first_run
+        )
+
+        # re-running extraction the way a file update or a history rebuild does keeps page, text and time identical
+        pdf.refresh_from_db()
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+        second_run = extract_annotation_state()
+
+        self.assertEqual(first_run, second_run)
+
+    def test_set_highlights_and_comments_skips_only_the_broken_annotation(self):
+        # break a single highlight (remove its quad points) and make sure the others are still extracted
+        broken_highlights = []
+
+        def break_first_highlight(annotation_object):
+            if annotation_object.get('/Subtype') == '/Highlight' and not broken_highlights:
+                del annotation_object['/QuadPoints']
+                broken_highlights.append(True)
+
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection,
+            name='pdf_one_broken_annotation',
+            file=build_demo_pdf_with_modified_annotations(break_first_highlight, 'broken_highlight.pdf'),
+        )
+
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        # the two comments and the remaining valid highlight survive, only the broken highlight is dropped
+        self.assertEqual(pdf.pdfcomment_set.count(), 2)
+        self.assertEqual(pdf.pdfhighlight_set.count(), 1)
+
+    def test_set_highlights_and_comments_unreadable_file_keeps_existing(self):
+        creation_date = datetime(2025, 3, 11, 8, 16, 49, tzinfo=timezone.utc)
+
+        pdf = Pdf.objects.create(
+            collection=self.user.profile.current_collection, name='pdf_unreadable_update', file='not_a_real_pdf'
+        )
+        PdfComment.objects.create(text='existing comment', page=1, creation_date=creation_date, pdf=pdf)
+        PdfHighlight.objects.create(text='existing highlight', page=2, creation_date=creation_date, pdf=pdf)
+
+        # the (updated) file cannot be parsed, so the already extracted annotations must be preserved, not wiped
+        service.PdfProcessingServices.set_highlights_and_comments(pdf)
+
+        self.assertEqual(pdf.pdfcomment_set.count(), 1)
+        self.assertEqual(pdf.pdfhighlight_set.count(), 1)
+        self.assertEqual(pdf.pdfcomment_set.first().text, 'existing comment')
+        self.assertEqual(pdf.pdfhighlight_set.first().text, 'existing highlight')
 
     @mock.patch('pdf.services.pdf_services.PdfProcessingServices.export_annotations_to_json')
     def test_export_annotations(self, mock_export_annotation_to_json):

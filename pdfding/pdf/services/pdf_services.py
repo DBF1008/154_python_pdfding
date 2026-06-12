@@ -1,7 +1,7 @@
 import re
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from logging import getLogger
 from math import floor
@@ -12,6 +12,7 @@ from uuid import uuid4
 from core.settings import MEDIA_ROOT
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files import File
+from django.db import transaction
 from django.db.models import QuerySet
 from django.forms import ValidationError
 from django.http import Http404, HttpRequest
@@ -35,6 +36,19 @@ from users.models import Profile
 import json
 
 logger = getLogger(__file__)
+
+# A PDF date string looks like "D:YYYYMMDDHHmmSSOHH'mm'" where the "D:" prefix and every component after the year are
+# optional and the timezone marker O is one of "+", "-" or "Z" (see the PDF specification). This regex tolerates
+# truncated and timezone-less values so that non-standard timestamps can still be parsed instead of raising.
+PDF_DATE_RE = re.compile(
+    r"(?P<year>\d{4})"
+    r"(?P<month>\d{2})?"
+    r"(?P<day>\d{2})?"
+    r"(?P<hour>\d{2})?"
+    r"(?P<minute>\d{2})?"
+    r"(?P<second>\d{2})?"
+    r"(?:(?P<tz_sign>[Zz+\-])(?P<tz_hour>\d{2})?'?(?P<tz_minute>\d{2})?'?)?"
+)
 
 
 class PdfProcessingServices:
@@ -153,59 +167,191 @@ class PdfProcessingServices:
         """
         Set the highlights and comments of a pdf.
 
+        Annotations are first parsed into memory and only written to the database once the pdf could be read
+        successfully. This way a pdf that cannot be opened - e.g. after a failed file update or while a history
+        rebuild processes a damaged file - keeps its previously extracted annotations instead of having them wiped.
+        Each annotation is parsed on its own so that a single malformed annotation, for example a highlight or
+        comment that is missing a standard timestamp, no longer causes the whole batch to be skipped.
+
         We need to have pdf_highlight_class and pdf_comment_class arguments so that the migration using this function
         can overwrite the classes with the model 'blueprints' we get via
         apps.get_model(("pdf", "PdfHighlight/PdfComment")) results. Without this the migrations will not work.
         """
 
         try:
-            # delete old comments and highlights
+            pypdf_pdf = PdfReader(pdf.file)
+            pyreadium_pdf = PdfDocument(pdf.file, autoclose=True)
+        except Exception:  # nosec # noqa
+            # the pdf could not be opened at all: keep the already extracted annotations untouched
+            logger.info(f'Could not read "{pdf.name}" of {cls.get_workspace_log_id(pdf)} for annotation extraction')
+            logger.info(traceback.format_exc())
+            return
+
+        comments = []
+        highlights = []
+
+        try:
+            for i, pypdf_page in enumerate(pypdf_pdf.pages):
+                if "/Annots" not in pypdf_page:
+                    continue
+
+                try:
+                    page_annotations = pypdf_page["/Annots"]
+                except Exception:  # nosec # noqa # pragma: no cover
+                    # the annotation array of a single page is broken: skip just this page, keep the others
+                    logger.info(
+                        f'Could not read the annotations on page {i + 1} of "{pdf.name}" '
+                        f'of {cls.get_workspace_log_id(pdf)}'
+                    )
+                    logger.info(traceback.format_exc())
+                    continue
+
+                # only loaded when a highlight on the page actually needs its text extracted
+                pdfium_page = None
+
+                for annotation in page_annotations:
+                    try:
+                        annotation_object = annotation.get_object()
+                        annotation_type = annotation_object.get("/Subtype")
+
+                        if annotation_type == "/FreeText":
+                            comment_text = annotation_object.get("/Contents")
+                            # a comment without any text cannot be stored, skip it instead of failing the batch
+                            if comment_text is None:
+                                continue
+                            comments.append(
+                                {
+                                    "text": str(comment_text),
+                                    "page": i + 1,
+                                    "creation_date": cls.extract_annotation_creation_date(annotation_object, pdf),
+                                }
+                            )
+
+                        elif annotation_type == "/Highlight":
+                            if pdfium_page is None:
+                                pdfium_page = pyreadium_pdf[i]
+                            highlights.append(
+                                {
+                                    "text": cls.extract_pdf_highlight_text(annotation_object, pdfium_page),
+                                    "page": i + 1,
+                                    "creation_date": cls.extract_annotation_creation_date(annotation_object, pdf),
+                                }
+                            )
+                    except Exception:  # nosec # noqa
+                        # a single malformed annotation must not drop the other annotations of the pdf
+                        logger.info(
+                            f'Could not extract an annotation on page {i + 1} of "{pdf.name}" '
+                            f'of {cls.get_workspace_log_id(pdf)}'
+                        )
+                        logger.info(traceback.format_exc())
+        except Exception:  # nosec # noqa # pragma: no cover
+            # a structural failure while walking the pdf must not wipe the already extracted annotations
+            logger.info(f'Could not extract annotations for "{pdf.name}" of {cls.get_workspace_log_id(pdf)}')
+            logger.info(traceback.format_exc())
+            return
+        finally:
+            pyreadium_pdf.close()
+
+        cls.replace_annotations(pdf, comments, highlights, pdf_highlight_class, pdf_comment_class)
+
+    @staticmethod
+    def replace_annotations(
+        pdf: Pdf, comments: list[dict], highlights: list[dict], pdf_highlight_class, pdf_comment_class
+    ) -> None:
+        """
+        Replace the stored comments and highlights of a pdf with the freshly parsed ones.
+
+        The delete and the re-create run inside a single transaction so that the stored annotations are never left
+        in a partially replaced state.
+        """
+
+        with transaction.atomic():
             pdf.pdfhighlight_set.all().delete()
             pdf.pdfcomment_set.all().delete()
 
-            pypdf_pdf = PdfReader(pdf.file)
-            pyreadium_pdf = PdfDocument(pdf.file, autoclose=True)
+            for comment in comments:
+                pdf_comment_class.objects.create(pdf=pdf, **comment)
+            for highlight in highlights:
+                pdf_highlight_class.objects.create(pdf=pdf, **highlight)
 
-            for i, pypdf_page in enumerate(pypdf_pdf.pages):
-                pdfium_page = pyreadium_pdf[i]
+    @classmethod
+    def extract_annotation_creation_date(cls, annotation_object, pdf: Pdf) -> datetime:
+        """
+        Get a stable creation date for an annotation.
 
-                if "/Annots" in pypdf_page:
-                    try:
-                        for annotation in pypdf_page["/Annots"]:
-                            annotation_object = annotation.get_object()
+        The annotation's /CreationDate is preferred, falling back to its /ModDate and finally to the creation date
+        of the pdf itself. All of these are deterministic, so re-running the extraction during an import, a file
+        update or a history rebuild keeps the stored time stable instead of producing a new value each time.
+        """
 
-                            annotation_type = annotation_object["/Subtype"]
+        creation_date = cls.parse_pdf_date(annotation_object.get("/CreationDate"))
 
-                            if annotation_type in ["/FreeText", "/Highlight"]:
-                                date_time_string = f'{annotation_object["/CreationDate"].split(':')[-1]}-+00:00'
-                                creation_date = datetime.strptime(date_time_string, '%Y%m%d%H%M%S-%z')
+        if creation_date is None:
+            creation_date = cls.parse_pdf_date(annotation_object.get("/ModDate"))
 
-                                if annotation_type == "/FreeText":
-                                    comment_text = annotation_object["/Contents"]
-                                    pdf_comment_class.objects.create(
-                                        text=comment_text, page=i + 1, creation_date=creation_date, pdf=pdf
-                                    )
+        if creation_date is None:
+            creation_date = pdf.creation_date
 
-                                elif annotation_type == "/Highlight":
-                                    highlight_text = cls.extract_pdf_highlight_text(annotation_object, pdfium_page)
-                                    pdf_highlight_class.objects.create(
-                                        text=highlight_text, page=i + 1, creation_date=creation_date, pdf=pdf
-                                    )
-                    except Exception as e:  # nosec # noqa # pragma: no cover
-                        workspace_id = pdf.collection.workspace.id
+        return creation_date
 
-                        logger.info(
-                            f'Could not extract highlights and comments for "{pdf.name}" of workspace "{workspace_id}"'
-                        )
-                        logger.info(traceback.format_exc())
+    @staticmethod
+    def parse_pdf_date(raw_date) -> datetime | None:
+        """
+        Parse a PDF date string such as "D:20250311081649+01'00'" into a timezone-aware datetime in UTC.
 
-            pyreadium_pdf.close()
+        Returns None when the value is missing or cannot be parsed so that callers can fall back to another
+        timestamp instead of dropping the annotation. Timezone-less values are treated as UTC, matching the
+        behaviour relied upon by the existing annotations.
+        """
 
-        except Exception as e:  # nosec # noqa
-            workspace_id = pdf.collection.workspace.id
+        if raw_date is None:
+            return None
 
-            logger.info(f'Could not extract highlights and comments for "{pdf.name}" of workspace "{workspace_id}"')
-            logger.info(traceback.format_exc())
+        date_string = str(raw_date).strip()
+
+        if date_string[:2].upper() == "D:":
+            date_string = date_string[2:]
+
+        match = PDF_DATE_RE.match(date_string)
+        if not match:
+            return None
+
+        parts = match.groupdict()
+
+        try:
+            year = int(parts["year"])
+            month = int(parts["month"] or 1)
+            day = int(parts["day"] or 1)
+            hour = int(parts["hour"] or 0)
+            minute = int(parts["minute"] or 0)
+            second = int(parts["second"] or 0)
+
+            tz_sign = parts["tz_sign"]
+            if tz_sign in (None, "Z", "z"):
+                tzinfo = timezone.utc
+            else:
+                offset = timedelta(hours=int(parts["tz_hour"] or 0), minutes=int(parts["tz_minute"] or 0))
+                tzinfo = timezone(-offset if tz_sign == "-" else offset)
+
+            parsed_date = datetime(year, month, day, hour, minute, second, tzinfo=tzinfo)
+        except (TypeError, ValueError):
+            return None
+
+        return parsed_date.astimezone(timezone.utc)
+
+    @staticmethod
+    def get_workspace_log_id(pdf: Pdf) -> str:
+        """
+        Best-effort workspace identifier used for logging.
+
+        This is resilient to historical model states (e.g. during migrations) where a pdf might not expose a
+        collection/workspace, so that logging never raises while an annotation error is being handled.
+        """
+
+        try:
+            return f'workspace "{pdf.collection.workspace.id}"'
+        except Exception:  # nosec # noqa # pragma: no cover
+            return "unknown workspace"
 
     @staticmethod
     def extract_pdf_highlight_text(annotation, pdfium_page):
