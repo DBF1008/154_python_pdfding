@@ -13,3 +13,16 @@ class PdfDingLocaleMiddleware(LocaleMiddleware):
             super().process_request(request)
         else:
             request.LANGUAGE_CODE = request.user.profile.language_code
+
+
+class WorkspaceCollectionSanitizeMiddleware:
+    """Ensure authenticated user's profile has valid workspace/collection state."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if hasattr(request, 'user') and request.user.is_authenticated:
+            request.user.profile.sanitize_state()
+
+        return self.get_response(request)

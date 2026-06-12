@@ -233,3 +233,34 @@ class Profile(models.Model):
             return True
         else:
             return False
+
+    def sanitize_state(self) -> bool:
+        """
+        Ensure current_workspace_id and current_collection_id point to valid objects.
+
+        Resets to safe defaults when stale:
+        - Workspace invalid → personal workspace (str(user_id)) + collection 'all'
+        - Collection invalid → 'all'
+
+        Returns True if any changes were made (and saved), False otherwise.
+        """
+
+        changed = False
+
+        workspace_valid = self.workspaces.filter(id=self.current_workspace_id).exists()
+
+        if not workspace_valid:
+            self.current_workspace_id = str(self.user_id)
+            self.current_collection_id = 'all'
+            changed = True
+        elif self.current_collection_id != 'all':
+            collection_valid = self.collections.filter(id=self.current_collection_id).exists()
+
+            if not collection_valid:
+                self.current_collection_id = 'all'
+                changed = True
+
+        if changed:
+            self.save(update_fields=['current_workspace_id', 'current_collection_id'])
+
+        return changed

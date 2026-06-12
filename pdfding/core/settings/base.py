@@ -59,6 +59,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.WorkspaceCollectionSanitizeMiddleware',
     "django.contrib.auth.middleware.LoginRequiredMiddleware",
     'core.middleware.PdfDingLocaleMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',

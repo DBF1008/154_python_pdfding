@@ -4,6 +4,7 @@ from django.test import TestCase, override_settings
 from pdf.models.collection_models import Collection
 from pdf.models.pdf_models import Pdf
 from pdf.models.shared_pdf_models import SharedPdf
+from pdf.models.workspace_models import WorkspaceRoles, WorkspaceUser
 from pdf.services.workspace_services import create_collection, create_workspace
 
 
@@ -179,3 +180,103 @@ class TestProfile(TestCase):
 
         self.assertTrue(profile.has_access_to_workspace(other_workspace.id))
         self.assertFalse(profile.has_access_to_workspace(other_user.profile.current_workspace_id))
+
+    def test_sanitize_state_no_change_needed(self):
+        """When state is valid, sanitize_state returns False and makes no DB writes."""
+
+        profile = self.user.profile
+        result = profile.sanitize_state()
+
+        self.assertFalse(result)
+        self.assertEqual(profile.current_workspace_id, str(self.user.id))
+
+    def test_sanitize_state_stale_workspace(self):
+        """When workspace doesn't exist, reset to personal workspace and 'all'."""
+
+        profile = self.user.profile
+        profile.current_workspace_id = '00000000-0000-0000-0000-000000000001'
+        profile.current_collection_id = '00000000-0000-0000-0000-000000000002'
+        profile.save()
+
+        result = profile.sanitize_state()
+
+        self.assertTrue(result)
+        profile.refresh_from_db()
+        self.assertEqual(profile.current_workspace_id, str(self.user.id))
+        self.assertEqual(profile.current_collection_id, 'all')
+
+    def test_sanitize_state_workspace_user_lost_access(self):
+        """When user was removed from workspace, reset to personal workspace."""
+
+        other_user = User.objects.create_user(username='other', password='12345', email='b@b.com')
+        shared_ws = create_workspace('shared', other_user)
+        WorkspaceUser.objects.create(workspace=shared_ws, user=self.user, role=WorkspaceRoles.MEMBER)
+
+        profile = self.user.profile
+        profile.current_workspace_id = shared_ws.id
+        profile.current_collection_id = 'all'
+        profile.save()
+
+        # Remove the user from the workspace
+        WorkspaceUser.objects.filter(workspace=shared_ws, user=self.user).delete()
+
+        result = profile.sanitize_state()
+
+        self.assertTrue(result)
+        profile.refresh_from_db()
+        self.assertEqual(profile.current_workspace_id, str(self.user.id))
+        self.assertEqual(profile.current_collection_id, 'all')
+
+    def test_sanitize_state_stale_collection(self):
+        """When collection doesn't exist in current workspace, reset to 'all'."""
+
+        workspace = create_workspace('test_ws', self.user)
+        collection = create_collection(workspace, 'temp_collection')
+
+        profile = self.user.profile
+        profile.current_workspace_id = workspace.id
+        profile.current_collection_id = collection.id
+        profile.save()
+
+        # Delete the collection
+        collection.delete()
+
+        result = profile.sanitize_state()
+
+        self.assertTrue(result)
+        profile.refresh_from_db()
+        self.assertEqual(profile.current_workspace_id, workspace.id)
+        self.assertEqual(profile.current_collection_id, 'all')
+
+    def test_sanitize_state_collection_all_unchanged(self):
+        """When collection_id is 'all', skip collection validation."""
+
+        workspace = create_workspace('test_ws', self.user)
+
+        profile = self.user.profile
+        profile.current_workspace_id = workspace.id
+        profile.current_collection_id = 'all'
+        profile.save()
+
+        result = profile.sanitize_state()
+
+        self.assertFalse(result)
+
+    def test_sanitize_state_collection_from_other_workspace(self):
+        """When collection belongs to a different workspace, reset to 'all'."""
+
+        ws1 = create_workspace('ws1', self.user)
+        ws2 = create_workspace('ws2', self.user)
+        collection_in_ws2 = create_collection(ws2, 'ws2_collection')
+
+        profile = self.user.profile
+        profile.current_workspace_id = ws1.id
+        profile.current_collection_id = collection_in_ws2.id
+        profile.save()
+
+        result = profile.sanitize_state()
+
+        self.assertTrue(result)
+        profile.refresh_from_db()
+        self.assertEqual(profile.current_workspace_id, ws1.id)
+        self.assertEqual(profile.current_collection_id, 'all')
