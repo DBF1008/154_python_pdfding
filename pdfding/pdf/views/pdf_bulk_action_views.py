@@ -8,7 +8,10 @@ from pdf.models.tag_models import Tag
 from pdf.models.workspace_models import Workspace
 from pdf.services.collection_services import change_collection_of_pdf
 from pdf.services.tag_services import TagServices
-from pdf.services.workspace_services import check_if_collection_part_of_workspace
+from pdf.services.workspace_services import (
+    check_if_collection_part_of_workspace,
+    filter_pdfs_belonging_to_workspace,
+)
 from pdf.views.pdf_views import PdfMixin
 
 
@@ -36,7 +39,7 @@ class BulkActions(PdfMixin, View):
                     self.set_collection(pdfs, request.user.profile.current_workspace, collection_id)
                 case 'set_tags':
                     tag_string = request.POST.get('tag_string')
-                    self.set_tags(pdfs, tag_string, request)
+                    self.set_tags(pdfs, tag_string, request, request.user.profile.current_workspace)
                 case 'star':
                     self.star(pdfs)
 
@@ -60,24 +63,36 @@ class BulkActions(PdfMixin, View):
 
     @staticmethod
     def set_collection(pdfs: list[Pdf], current_workspace: Workspace, collection_id: str) -> None:
-        """Set the collection of the Pdfs."""
+        """
+        Set the collection of the Pdfs. Only PDFs that belong to the current workspace are changed, so
+        that a stale or mixed bulk selection cannot move PDFs of another workspace into the current one.
+        """
 
         if check_if_collection_part_of_workspace(current_workspace, collection_id):
-            for pdf in pdfs:
+            for pdf in filter_pdfs_belonging_to_workspace(pdfs, current_workspace):
                 change_collection_of_pdf(pdf, collection_id)
         else:
             raise Http404('Collection does not exists in the current workspace!')
 
     @staticmethod
-    def set_tags(pdfs: list[Pdf], tag_string: str, request: HttpRequest) -> None:
-        """Set the tags of the Pdfs."""
+    def set_tags(pdfs: list[Pdf], tag_string: str, request: HttpRequest, current_workspace: Workspace) -> None:
+        """
+        Set the tags of the Pdfs. Tags are workspace-scoped, so only PDFs that belong to the current
+        workspace are changed and the tags are always created in the current workspace. This prevents a
+        stale or mixed bulk selection from attaching tags of one workspace to PDFs of another.
+        """
 
         for char in tag_string:
             if not (char.isalnum() or char in ['/', '-', '_', ' ']):
                 messages.warning(request, _('Only letters, numbers, "/", "-" and "_" are valid characters!'))
 
+        pdfs = filter_pdfs_belonging_to_workspace(pdfs, current_workspace)
+
+        if not pdfs:
+            return
+
         tag_names = Tag.parse_tag_string(tag_string)
-        tags = TagServices.process_tag_names(tag_names, pdfs[0].collection.workspace)
+        tags = TagServices.process_tag_names(tag_names, current_workspace)
 
         for pdf in pdfs:
             # check if tag needs to be deleted

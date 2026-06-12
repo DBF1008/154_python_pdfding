@@ -67,6 +67,19 @@ def check_if_collection_part_of_workspace(workspace: Workspace, collection_id: s
         return False
 
 
+def filter_pdfs_belonging_to_workspace(pdfs: list[Pdf], workspace: Workspace) -> list[Pdf]:
+    """
+    Return only the PDFs that belong to the given workspace.
+
+    Bulk selections are supplied by the frontend and may contain stale or mixed-in PDFs from other
+    workspaces, e.g. left over after the current workspace was switched. Operations that attach
+    workspace-scoped objects such as collections or tags must restrict themselves to PDFs of the
+    current workspace to avoid cross-workspace pollution.
+    """
+
+    return [pdf for pdf in pdfs if pdf.collection.workspace_id == workspace.id]
+
+
 def get_pdfs_of_workspace(workspace: Workspace) -> QuerySet[Pdf]:
     """Get all PDFs of the workspace."""
 

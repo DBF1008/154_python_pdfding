@@ -5,7 +5,7 @@ from django.test import Client, TestCase
 from django.urls import reverse
 from pdf.models.pdf_models import Pdf
 from pdf.models.tag_models import Tag
-from pdf.services.workspace_services import create_collection
+from pdf.services.workspace_services import create_collection, create_workspace
 
 
 class BulkActionTestCase(TestCase):
@@ -201,5 +201,139 @@ class BulkActionTestCase(TestCase):
             # we need to update the pdf
             changed_pdf = Pdf.objects.get(id=pdf.id)
             assert changed_pdf.starred == expected_result
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def create_pdf_in_other_workspace(self):
+        """
+        Create a PDF that lives in a second workspace the user belongs to but which is not the current
+        workspace. This mimics a stale or mixed bulk selection after switching workspaces: the user can
+        access the PDF (so it does not 404), but collection and tag changes targeting the current
+        workspace must not touch it.
+        """
+
+        other_workspace = create_workspace(name='other_workspace', creator=self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        return other_workspace, other_collection, foreign_pdf
+
+    @mock.patch('pdf.views.pdf_bulk_action_views.change_collection_of_pdf')
+    def test_set_collection_skips_pdf_from_other_workspace(self, mock_change_collection):
+        other_workspace, other_collection, foreign_pdf = self.create_pdf_in_other_workspace()
+        target_collection = create_collection(workspace=self.user.profile.current_workspace, collection_name='target')
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_collection',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'collection_id': target_collection.id,
+            },
+        )
+
+        # only the current-workspace pdf is moved; the foreign pdf stays in its own workspace
+        mock_change_collection.assert_called_once_with(self.pdf_1, target_collection.id)
+        assert Pdf.objects.get(id=foreign_pdf.id).collection == other_collection
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_set_tags_skips_pdf_from_other_workspace(self):
+        other_workspace, _, foreign_pdf = self.create_pdf_in_other_workspace()
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_tags',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'tag_string': 'one two',
+            },
+        )
+
+        current_workspace = self.user.profile.current_workspace
+
+        # the current-workspace pdf gets the tags, created in the current workspace
+        assert self.pdf_1.tags.count() == 2
+        for tag in self.pdf_1.tags.all():
+            assert tag.workspace == current_workspace
+
+        # the foreign pdf is left untouched and no tag leaks into the other workspace
+        assert foreign_pdf.tags.count() == 0
+        assert not Tag.objects.filter(workspace=other_workspace).exists()
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_set_tags_uses_current_workspace_not_first_selected_pdf(self):
+        other_workspace, _, foreign_pdf = self.create_pdf_in_other_workspace()
+
+        # the foreign pdf is listed first: the previous implementation anchored the tag workspace to the
+        # first selected pdf, which would create the tag in - and leak it to - the other workspace
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_tags',
+                'bulk_selected_pdfs': ','.join([str(foreign_pdf.id), str(self.pdf_1.id)]),
+                'tag_string': 'shared',
+            },
+        )
+
+        current_workspace = self.user.profile.current_workspace
+
+        tag = Tag.objects.get(name='shared')
+        assert tag.workspace == current_workspace
+        assert list(self.pdf_1.tags.all()) == [tag]
+        assert foreign_pdf.tags.count() == 0
+        assert not Tag.objects.filter(workspace=other_workspace).exists()
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_archive_includes_pdf_from_other_workspace(self):
+        _, _, foreign_pdf = self.create_pdf_in_other_workspace()
+        assert not foreign_pdf.archived
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'archive',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+            },
+        )
+
+        assert Pdf.objects.get(id=self.pdf_1.id).archived
+        assert Pdf.objects.get(id=foreign_pdf.id).archived
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_star_includes_pdf_from_other_workspace(self):
+        _, _, foreign_pdf = self.create_pdf_in_other_workspace()
+        assert not foreign_pdf.starred
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'star',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+            },
+        )
+
+        assert Pdf.objects.get(id=self.pdf_1.id).starred
+        assert Pdf.objects.get(id=foreign_pdf.id).starred
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_delete_includes_pdf_from_other_workspace(self):
+        _, _, foreign_pdf = self.create_pdf_in_other_workspace()
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'delete',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'delete_confirmation': 'yes',
+            },
+        )
+
+        assert not Pdf.objects.filter(id=self.pdf_1.id).exists()
+        assert not Pdf.objects.filter(id=foreign_pdf.id).exists()
 
         self.assertRedirects(response, reverse('pdf_overview'), status_code=302)

@@ -133,3 +133,23 @@ class TestWorkspaceServices(TestCase):
 
         for ws_shared_pdf, shared_pdf in zip(ws_shared_pdfs.order_by('name'), [shared_pdf_1, shared_pdf_2]):
             self.assertEqual(ws_shared_pdf, shared_pdf)
+
+    def test_filter_pdfs_belonging_to_workspace(self):
+        ws = self.user.profile.current_workspace
+        default_collection = self.user.profile.current_collection
+        other_ws = workspace_services.create_workspace('other_ws', self.user)
+        other_collection = other_ws.collections.first()
+
+        pdf_1 = Pdf.objects.create(name='pdf_1', collection=default_collection)
+        pdf_2 = Pdf.objects.create(name='pdf_2', collection=default_collection)
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        # only the pdfs of the queried workspace are kept, regardless of the input order
+        self.assertEqual(
+            workspace_services.filter_pdfs_belonging_to_workspace([pdf_1, foreign_pdf, pdf_2], ws),
+            [pdf_1, pdf_2],
+        )
+        self.assertEqual(
+            workspace_services.filter_pdfs_belonging_to_workspace([pdf_1, foreign_pdf, pdf_2], other_ws),
+            [foreign_pdf],
+        )
