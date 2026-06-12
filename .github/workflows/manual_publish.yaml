@@ -1,0 +1,50 @@
+name: PdfDing Manual Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag for manual publishing
+        type: string
+        required: true
+        default: dev
+      platform:
+        description: Architecture for manual publishing
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+          - linux/amd64,linux/arm64
+      branch:
+        description: Branch for manual publishing
+        type: string
+        required: true
+        default: master
+
+jobs:
+  manual_publish:
+    name: Manual Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v.5.0.0
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # 3.11.1
+      - name: Login to Docker Hub
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          username: mrmn
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          build-args: |
+            CI_COMMIT_TAG=${{ inputs.tag }}
+          push: true
+          tags: |
+            mrmn/pdfding:${{ inputs.tag }}
+          platforms: ${{ inputs.platform }}

@@ -1,0 +1,24 @@
+{% extends 'layouts/box_allauth.html' %}
+{% load static %}
+{% load i18n %}
+{% block content %}
+
+<div class="*:flex [&>*]:justify-left">
+    <div class="flex items-center justify-center bg-primary w-24 h-24 rounded-full">
+        <!-- bg-primary needed as profile image will flicker otherwise -->
+        <img class="bg-primary w-16 h-16" src="{% static 'images/logo.svg' %}" alt="Logo"/>
+    </div>
+    <h1 class="pt-8">{% trans 'View Shared PDF' %}</h1>
+    <span class="text-2xl font-bold pt-4 pb-8">{{ shared_pdf.pdf.name }}</span>
+
+    <form class="w-3/4 gap-x-1" action="{% url 'view_shared_pdf' shared_pdf.id %}" method="post">
+        {% csrf_token %}
+        {% if shared_pdf.password %}
+        {{ form.as_p }}
+        {% endif %}
+        <div class="flex justify-center">
+          <button class="flex items-center h-12" type="submit">{% trans 'View' context 'view pdf' %}</button>
+        </div>
+  </form>
+</div>
+{% endblock %}
