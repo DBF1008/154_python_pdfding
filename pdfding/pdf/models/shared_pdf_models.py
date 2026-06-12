@@ -50,9 +50,19 @@ class SharedPdf(models.Model):
     def inactive(self) -> bool:
         """Wether the shared pdf is inactive. This will consider the expiration date and max views."""
 
-        return (self.max_views and self.views >= self.max_views) or (
-            self.expiration_date and datetime.now(timezone.utc) >= self.expiration_date
-        )
+        return self.max_views_reached or self.expired
+
+    @property
+    def max_views_reached(self) -> bool:
+        """Wether the maximum number of views has been reached."""
+
+        return bool(self.max_views and self.views >= self.max_views)
+
+    @property
+    def expired(self) -> bool:
+        """Wether the shared pdf is expired. This will consider the expiration date."""
+
+        return bool(self.expiration_date and datetime.now(timezone.utc) >= self.expiration_date)
 
     @property
     def deleted(self) -> bool:

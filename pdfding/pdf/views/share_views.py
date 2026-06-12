@@ -308,10 +308,13 @@ class ViewShared(BaseSharedPdfPublicView):
     def get(self, request: HttpRequest, identifier: str):
         shared_pdf = self.get_shared_pdf_public(request, identifier)
 
-        if shared_pdf.inactive or shared_pdf.deleted:
-            return render(request, 'view_shared_inactive.html')
-        elif check_shared_access_allowed(shared_pdf, request.session):
+        # A session that has already been granted access keeps it until the share is deleted or expires, even if
+        # the max views limit has since been reached by this very view. Checking this first lets the pdf file load
+        # and the page be refreshed during the first view instead of the view counting itself out immediately.
+        if check_shared_access_allowed(shared_pdf, request.session):
             return self.render_shared_pdf_view(request, shared_pdf)
+        elif shared_pdf.inactive or shared_pdf.deleted:
+            return render(request, 'view_shared_inactive.html')
         else:
             return render(
                 request,
@@ -322,28 +325,44 @@ class ViewShared(BaseSharedPdfPublicView):
     def post(self, request: HttpRequest, identifier: str):
         shared_pdf = self.get_shared_pdf_public(request, identifier)
 
+        # If this session was already granted access just send it back to the viewer. This keeps a password
+        # protected share consistent for the same session and avoids consuming a second view on repeated submits.
+        if check_shared_access_allowed(shared_pdf, request.session):
+            return redirect('view_shared_pdf', identifier=shared_pdf.id)
+
         if shared_pdf.inactive or shared_pdf.deleted:
             return render(request, 'view_shared_inactive.html')
+
+        form = ViewSharedPasswordForm(request.POST, shared_pdf=shared_pdf)
+
+        if not shared_pdf.password or form.is_valid():
+            self.grant_access(request, shared_pdf)
+            return redirect('view_shared_pdf', identifier=shared_pdf.id)
         else:
-            form = ViewSharedPasswordForm(request.POST, shared_pdf=shared_pdf)
-
-            if not shared_pdf.password or form.is_valid():
-                if not request.session or not request.session.session_key:
-                    request.session.create()
-                    # set session expiry to 1 week
-                    request.session.set_expiry(604800)
-                    request.session.save()
-
-                shared_pdf.sessions.add(Session.objects.get(session_key=request.session.session_key))
-                return redirect('view_shared_pdf', identifier=shared_pdf.id)
-            else:
-                return render(request, 'view_shared_info.html', {'shared_pdf': shared_pdf, 'form': form})
+            return render(request, 'view_shared_info.html', {'shared_pdf': shared_pdf, 'form': form})
 
     @staticmethod
-    def render_shared_pdf_view(request: HttpRequest, shared_pdf: SharedPdf):
+    def grant_access(request: HttpRequest, shared_pdf: SharedPdf):
+        """
+        Grant the current session access to the shared pdf and count it as a single view.
+
+        The view is counted once, when the session is granted access. Reloading the viewer or (re)loading the pdf
+        file afterwards does not consume additional views, so a max views limited share can be read completely on
+        the first view.
+        """
+
+        if not request.session or not request.session.session_key:
+            request.session.create()
+            # set session expiry to 1 week
+            request.session.set_expiry(604800)
+            request.session.save()
+
+        shared_pdf.sessions.add(Session.objects.get(session_key=request.session.session_key))
         shared_pdf.views += 1
         shared_pdf.save()
 
+    @staticmethod
+    def render_shared_pdf_view(request: HttpRequest, shared_pdf: SharedPdf):
         theme, theme_color = get_viewer_theme_and_color()
 
         return render(

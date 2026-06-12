@@ -334,8 +334,10 @@ class TestViewSharedPdf(TestCase):
         self.assertEqual(response.context['user_view_bool'], False)
         self.assertTemplateUsed(response, 'viewer.html')
 
+        # rendering the viewer for an already granted session must not consume a view; views are only counted
+        # once, when a session is granted access in the POST handler.
         shared_pdf = SharedPdf.objects.get(pk=self.shared_pdf.id)
-        self.assertEqual(shared_pdf.views, 1)
+        self.assertEqual(shared_pdf.views, 0)
 
     def test_view_get_inactive(self):
         inactive_shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='inactive_shared_pdf', views=2, max_views=1)
@@ -391,3 +393,79 @@ class TestViewSharedPdf(TestCase):
         response = self.client.post(reverse('view_shared_pdf', kwargs={'identifier': deleted_shared_pdf.id}))
 
         self.assertTemplateUsed(response, 'view_shared_inactive.html')
+
+    def test_view_max_views_one_allows_complete_first_view(self):
+        # regression: with max views set to one, entering the viewer used to consume the only view, so afterwards
+        # loading the actual pdf file and refreshing the page were denied. The first viewing session must be able
+        # to read the file completely and refresh without being locked out.
+        shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='limited_shared_pdf', max_views=1)
+        url = reverse('view_shared_pdf', kwargs={'identifier': shared_pdf.id})
+
+        # granting access (no password) counts as the single view
+        self.client.post(url)
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 1)
+        self.assertEqual(shared_pdf.sessions.count(), 1)
+
+        # the granted session still sees the viewer (not the inactive page) ...
+        response = self.client.get(url)
+        self.assertTemplateUsed(response, 'viewer.html')
+        # ... and is still allowed to load the actual pdf file
+        self.assertEqual(PdfPublicMixin.get_object(response.wsgi_request, shared_pdf.id), self.pdf)
+
+        # refreshing the viewer keeps working and does not consume additional views
+        response = self.client.get(url)
+        self.assertTemplateUsed(response, 'viewer.html')
+        self.assertEqual(PdfPublicMixin.get_object(response.wsgi_request, shared_pdf.id), self.pdf)
+
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 1)
+
+    def test_view_max_views_one_blocks_new_session(self):
+        # regression: the max views limit must still block a *new* viewer once it has been reached.
+        shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='limited_shared_pdf', max_views=1)
+        url = reverse('view_shared_pdf', kwargs={'identifier': shared_pdf.id})
+
+        # the first session uses up the single view
+        self.client.post(url)
+
+        # a different session is not allowed in anymore, neither via GET nor POST
+        other_client = Client()
+        self.assertTemplateUsed(other_client.get(url), 'view_shared_inactive.html')
+        self.assertTemplateUsed(other_client.post(url), 'view_shared_inactive.html')
+
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 1)
+
+    def test_view_password_share_consistent_for_session(self):
+        # regression: a password protected, max-views limited share must behave consistently for the same session.
+        # Once the password is accepted the session can load the file and refresh, and re-submitting the form does
+        # not consume another view.
+        shared_pdf = SharedPdf.objects.create(
+            pdf=self.pdf, name='protected_limited', password=make_password('some_pw'), max_views=1
+        )
+        url = reverse('view_shared_pdf', kwargs={'identifier': shared_pdf.id})
+
+        # a wrong password keeps the session out and does not consume a view
+        response = self.client.post(url, data={'password_input': 'wrong'})
+        self.assertTemplateUsed(response, 'view_shared_info.html')
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 0)
+        self.assertEqual(shared_pdf.sessions.count(), 0)
+
+        # the correct password grants access and counts a single view
+        self.client.post(url, data={'password_input': 'some_pw'})
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 1)
+        self.assertEqual(shared_pdf.sessions.count(), 1)
+
+        # the same session can now view and load the file even though the view limit is reached
+        response = self.client.get(url)
+        self.assertTemplateUsed(response, 'viewer.html')
+        self.assertEqual(PdfPublicMixin.get_object(response.wsgi_request, shared_pdf.id), self.pdf)
+
+        # re-submitting the form for the already granted session just redirects and does not consume another view
+        response = self.client.post(url)
+        self.assertRedirects(response, url)
+        shared_pdf.refresh_from_db()
+        self.assertEqual(shared_pdf.views, 1)

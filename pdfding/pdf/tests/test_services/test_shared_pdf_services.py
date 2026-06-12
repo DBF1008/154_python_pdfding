@@ -8,6 +8,7 @@ from django.urls import reverse
 from pdf.models.pdf_models import Pdf
 from pdf.models.shared_pdf_models import SharedPdf
 from pdf.services.shared_pdf_services import (
+    check_session_granted,
     check_shared_access_allowed,
     check_shared_access_allowed_by_identifier,
     get_future_datetime,
@@ -67,6 +68,46 @@ class TestSharedPdfServices(TestCase):
         deleted_shared_pdf.sessions.add(Session.objects.get(session_key=request.session.session_key))
 
         assert not check_shared_access_allowed(deleted_shared_pdf, request.session)
+
+    def test_check_shared_access_allowed_granted_session_bypasses_max_views(self):
+        # regression: a session that was already granted access keeps it even after the max views limit is reached,
+        # so the pdf file can still be loaded and the page refreshed during the view.
+        response = self.client.get(reverse('pdf_overview'))
+        request = response.wsgi_request
+        request.session.create()
+
+        pdf = Pdf.objects.create(name='bla', collection_id=self.user.id)
+        shared_pdf = SharedPdf.objects.create(pdf=pdf, name='share', max_views=1, views=1)
+        shared_pdf.sessions.add(Session.objects.get(session_key=request.session.session_key))
+
+        assert check_shared_access_allowed(shared_pdf, request.session)
+
+    def test_check_shared_access_allowed_max_views_blocks_new_session(self):
+        # a session that was never granted access is not allowed in (the max views limit has been reached).
+        response = self.client.get(reverse('pdf_overview'))
+        request = response.wsgi_request
+        request.session.create()
+
+        pdf = Pdf.objects.create(name='bla', collection_id=self.user.id)
+        shared_pdf = SharedPdf.objects.create(pdf=pdf, name='share', max_views=1, views=1)
+
+        assert not check_shared_access_allowed(shared_pdf, request.session)
+
+    def test_check_session_granted(self):
+        response = self.client.get(reverse('pdf_overview'))
+        request = response.wsgi_request
+        request.session.create()
+
+        pdf = Pdf.objects.create(name='bla', collection_id=self.user.id)
+        shared_pdf = SharedPdf.objects.create(pdf=pdf, name='share')
+
+        assert not check_session_granted(shared_pdf, request.session)
+
+        shared_pdf.sessions.add(Session.objects.get(session_key=request.session.session_key))
+        assert check_session_granted(shared_pdf, request.session)
+
+        request.session.set_expiry(-1)
+        assert not check_session_granted(shared_pdf, request.session)
 
     @mock.patch('pdf.services.shared_pdf_services.check_shared_access_allowed')
     def test_check_shared_access_allowed_by_identifier(self, mock_check):

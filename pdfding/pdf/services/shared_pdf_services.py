@@ -13,19 +13,31 @@ def check_shared_access_allowed_by_identifier(identifier: str, session: Session)
 
 
 def check_shared_access_allowed(shared_pdf: SharedPdf, session: Session):
-    """Check if access to shared pdf is allowed based on session."""
+    """
+    Check if access to a shared pdf is allowed for the given session.
 
-    if shared_pdf.inactive or shared_pdf.deleted:
+    A session is granted access once it has been added to the shared pdf's sessions (after passing a possible
+    password check). The max views limit only controls how many sessions can be granted access in the first place;
+    it does not cut off a session that is already viewing the file. This way the pdf file can be loaded and the page
+    refreshed during a view without the view counting itself out immediately. Expiration and deletion always revoke
+    access, even for a session that was granted access before.
+    """
+
+    if shared_pdf.deleted or shared_pdf.expired:
         return False
 
-    if (
+    return check_session_granted(shared_pdf, session)
+
+
+def check_session_granted(shared_pdf: SharedPdf, session: Session) -> bool:
+    """Check if the given session has been granted access to the shared pdf and is still valid (not expired)."""
+
+    return bool(
         session
+        and session.session_key
         and (session.get_expiry_date() - datetime.now(timezone.utc)).total_seconds() > 0
         and shared_pdf.sessions.filter(session_key=session.session_key).count()
-    ):
-        return True
-    else:
-        return False
+    )
 
 
 def get_future_datetime(time_input: str) -> datetime | None:

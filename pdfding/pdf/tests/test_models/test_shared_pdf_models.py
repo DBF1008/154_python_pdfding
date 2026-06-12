@@ -44,6 +44,25 @@ class TestSharedPdf(TestCase):
 
         self.assertTrue(shared_pdf.inactive)
 
+    def test_max_views_reached(self):
+        for max_views, views, expected_result in [(None, 5, False), (2, 1, False), (2, 2, True), (2, 4, True)]:
+            shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='share', max_views=max_views, views=views)
+
+            self.assertEqual(shared_pdf.max_views_reached, expected_result)
+
+    def test_expired(self):
+        for minutes, expected_result in [(5, False), (-5, True)]:
+            expiration_date = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+            shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='share', expiration_date=expiration_date)
+
+            self.assertEqual(shared_pdf.expired, expected_result)
+
+    def test_expired_no_date(self):
+        shared_pdf = SharedPdf.objects.create(pdf=self.pdf, name='share')
+
+        self.assertFalse(shared_pdf.expired)
+
     def test_deleted(self):
         for minutes, exptected_result in [(5, False), (-5, True)]:
             deletion_date = datetime.now(timezone.utc) + timedelta(minutes=minutes)
