@@ -5,7 +5,7 @@ from django.test import Client, TestCase
 from django.urls import reverse
 from pdf.models.pdf_models import Pdf
 from pdf.models.tag_models import Tag
-from pdf.services.workspace_services import create_collection
+from pdf.services.workspace_services import create_collection, create_workspace
 
 
 class BulkActionTestCase(TestCase):
@@ -203,3 +203,171 @@ class BulkActionTestCase(TestCase):
             assert changed_pdf.starred == expected_result
 
         self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+    def test_set_collection_cross_workspace_rejected(self):
+        """Regression: set_collection must reject PDFs that do not belong to the current workspace."""
+
+        # Create a second workspace and a PDF that lives in it
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        # Current workspace still has the original collection; pick a target collection inside it
+        target_collection = create_collection(
+            workspace=self.user.profile.current_workspace, collection_name='target'
+        )
+
+        # Mixing a local PDF with a foreign one must be rejected
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_collection',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'collection_id': target_collection.id,
+            },
+        )
+
+        assert response.status_code == 404
+
+        # The local PDF must NOT have been moved
+        self.pdf_1.refresh_from_db()
+        assert self.pdf_1.collection == self.user.profile.current_collection
+
+        # The foreign PDF must NOT have been moved either
+        foreign_pdf.refresh_from_db()
+        assert foreign_pdf.collection == other_collection
+
+    def test_set_collection_only_foreign_pdf_rejected(self):
+        """Regression: set_collection must reject a request that contains only foreign PDFs."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        target_collection = create_collection(
+            workspace=self.user.profile.current_workspace, collection_name='target'
+        )
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_collection',
+                'bulk_selected_pdfs': str(foreign_pdf.id),
+                'collection_id': target_collection.id,
+            },
+        )
+
+        assert response.status_code == 404
+
+        foreign_pdf.refresh_from_db()
+        assert foreign_pdf.collection == other_collection
+
+    def test_set_tags_cross_workspace_rejected(self):
+        """Regression: set_tags must reject PDFs that do not belong to the current workspace."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        original_local_tags = list(self.pdf_1.tags.all())
+        original_foreign_tags = list(foreign_pdf.tags.all())
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_tags',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'tag_string': 'one two',
+            },
+        )
+
+        assert response.status_code == 404
+
+        # Neither PDF should have had its tags changed
+        self.pdf_1.refresh_from_db()
+        foreign_pdf.refresh_from_db()
+        assert list(self.pdf_1.tags.all()) == original_local_tags
+        assert list(foreign_pdf.tags.all()) == original_foreign_tags
+
+    def test_set_tags_only_foreign_pdf_rejected(self):
+        """Regression: set_tags must reject a request that contains only foreign PDFs."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'set_tags',
+                'bulk_selected_pdfs': str(foreign_pdf.id),
+                'tag_string': 'one two',
+            },
+        )
+
+        assert response.status_code == 404
+        assert foreign_pdf.tags.count() == 0
+
+    def test_archive_cross_workspace_still_works(self):
+        """Archive must continue to work even if the selection spans multiple workspaces."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'archive',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+            },
+        )
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+        self.pdf_1.refresh_from_db()
+        foreign_pdf.refresh_from_db()
+        assert self.pdf_1.archived is True
+        assert foreign_pdf.archived is True
+
+    def test_delete_cross_workspace_still_works(self):
+        """Delete must continue to work even if the selection spans multiple workspaces."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'delete',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+                'delete_confirmation': 'yes',
+            },
+        )
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+        assert not Pdf.objects.filter(id=self.pdf_1.id).exists()
+        assert not Pdf.objects.filter(id=foreign_pdf.id).exists()
+
+    def test_star_cross_workspace_still_works(self):
+        """Star must continue to work even if the selection spans multiple workspaces."""
+
+        other_workspace = create_workspace('other_ws', self.user)
+        other_collection = other_workspace.collections.first()
+        foreign_pdf = Pdf.objects.create(name='foreign_pdf', collection=other_collection)
+
+        response = self.client.post(
+            reverse('bulk_actions'),
+            data={
+                'selected_bulk_action': 'star',
+                'bulk_selected_pdfs': ','.join([str(self.pdf_1.id), str(foreign_pdf.id)]),
+            },
+        )
+
+        self.assertRedirects(response, reverse('pdf_overview'), status_code=302)
+
+        self.pdf_1.refresh_from_db()
+        foreign_pdf.refresh_from_db()
+        assert self.pdf_1.starred is True
+        assert foreign_pdf.starred is True

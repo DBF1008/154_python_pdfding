@@ -32,15 +32,27 @@ class BulkActions(PdfMixin, View):
                     confirmation = request.POST.get('delete_confirmation')
                     self.delete(pdfs, confirmation)
                 case 'set_collection':
+                    current_workspace = request.user.profile.current_workspace
+                    self._validate_pdfs_belong_to_workspace(pdfs, current_workspace)
                     collection_id = request.POST.get('collection_id')
-                    self.set_collection(pdfs, request.user.profile.current_workspace, collection_id)
+                    self.set_collection(pdfs, current_workspace, collection_id)
                 case 'set_tags':
+                    current_workspace = request.user.profile.current_workspace
+                    self._validate_pdfs_belong_to_workspace(pdfs, current_workspace)
                     tag_string = request.POST.get('tag_string')
                     self.set_tags(pdfs, tag_string, request)
                 case 'star':
                     self.star(pdfs)
 
         return redirect(request.META.get('HTTP_REFERER', 'pdf_overview'))
+
+    @staticmethod
+    def _validate_pdfs_belong_to_workspace(pdfs: list[Pdf], workspace: Workspace) -> None:
+        """Validate that all PDFs belong to the specified workspace. Raise Http404 if not."""
+
+        for pdf in pdfs:
+            if pdf.collection.workspace_id != workspace.id:
+                raise Http404('One or more PDFs do not belong to the current workspace!')
 
     @staticmethod
     def archive(pdfs: list[Pdf]) -> None:
