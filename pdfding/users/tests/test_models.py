@@ -179,3 +179,73 @@ class TestProfile(TestCase):
 
         self.assertTrue(profile.has_access_to_workspace(other_workspace.id))
         self.assertFalse(profile.has_access_to_workspace(other_user.profile.current_workspace_id))
+
+    def test_normalize_current_state_valid_noop(self):
+        profile = self.user.profile
+
+        # default state: personal workspace + default collection (both valid)
+        self.assertFalse(profile.normalize_current_state())
+        self.assertEqual(profile.current_workspace_id, str(self.user.id))
+        self.assertEqual(profile.current_collection_id, str(self.user.id))
+
+    def test_normalize_current_state_all_collection_noop(self):
+        profile = self.user.profile
+        profile.current_collection_id = 'all'
+        profile.save()
+
+        self.assertFalse(profile.normalize_current_state())
+        self.assertEqual(profile.current_collection_id, 'all')
+
+    def test_normalize_current_state_stale_workspace(self):
+        profile = self.user.profile
+        profile.current_workspace_id = 'does-not-exist'
+        profile.current_collection_id = 'does-not-exist'
+        profile.save()
+
+        self.assertTrue(profile.normalize_current_state())
+
+        refreshed = User.objects.get(id=self.user.id).profile
+        self.assertEqual(refreshed.current_workspace_id, str(self.user.id))
+        self.assertEqual(refreshed.current_collection_id, 'all')
+
+    def test_normalize_current_state_deleted_collection(self):
+        profile = self.user.profile
+        other_collection = create_collection(profile.current_workspace, 'other')
+        profile.current_collection_id = other_collection.id
+        profile.save()
+        other_collection.delete()
+
+        self.assertTrue(profile.normalize_current_state())
+
+        refreshed = User.objects.get(id=self.user.id).profile
+        # the workspace is still valid, only the collection falls back to 'all'
+        self.assertEqual(refreshed.current_workspace_id, str(self.user.id))
+        self.assertEqual(refreshed.current_collection_id, 'all')
+
+    def test_normalize_current_state_foreign_collection(self):
+        profile = self.user.profile
+        other_workspace = create_workspace('other_ws', self.user)
+        foreign_collection = create_collection(other_workspace, 'foreign')
+
+        # current workspace stays personal (valid), but the collection belongs to another workspace
+        profile.current_collection_id = foreign_collection.id
+        profile.save()
+
+        self.assertTrue(profile.normalize_current_state())
+
+        refreshed = User.objects.get(id=self.user.id).profile
+        self.assertEqual(refreshed.current_workspace_id, str(self.user.id))
+        self.assertEqual(refreshed.current_collection_id, 'all')
+
+    def test_current_pdfs_foreign_collection_no_leak(self):
+        profile = self.user.profile
+        other_workspace = create_workspace('other_ws', self.user)
+        foreign_collection = create_collection(other_workspace, 'foreign')
+        Pdf.objects.create(name='foreign_pdf', collection=foreign_collection)
+
+        # personal workspace is current, but the collection id points into another workspace;
+        # current_pdfs must not leak the foreign workspace's PDFs
+        profile.current_collection_id = foreign_collection.id
+        profile.save()
+
+        self.assertEqual(profile.current_pdfs.count(), 0)

@@ -155,7 +155,11 @@ class Profile(models.Model):
         if self.current_collection_id == 'all':
             pdfs = Pdf.objects.filter(collection__in=self.current_workspace.collections)
         else:
-            pdfs = Pdf.objects.filter(collection_id=self.current_collection_id)
+            # scope to the current workspace so a stale or foreign collection id can never leak PDFs
+            # from a different workspace into the overview
+            pdfs = Pdf.objects.filter(
+                collection__in=self.current_workspace.collections.filter(id=self.current_collection_id)
+            )
 
         return pdfs
 
@@ -233,3 +237,31 @@ class Profile(models.Model):
             return True
         else:
             return False
+
+    def normalize_current_state(self) -> bool:
+        """
+        Ensure current_workspace_id and current_collection_id point to a valid, mutually consistent
+        selection and fall back to safe values otherwise. A workspace the user can no longer access
+        falls back to the personal workspace (and the collection to 'all'); a collection that no longer
+        belongs to the current workspace falls back to 'all'. Only persists and returns True if a repair
+        was actually made, so it is cheap and safe to call on every request.
+        """
+
+        changed = False
+
+        if not self.workspaces.filter(id=self.current_workspace_id).exists():
+            # the personal workspace (id == str(user.id)) always exists and cannot be deleted
+            self.current_workspace_id = str(self.user_id)
+            self.current_collection_id = 'all'
+            changed = True
+        # 'all' is always valid; any other collection must belong to the (now valid) current workspace
+        elif (
+            self.current_collection_id != 'all' and not self.collections.filter(id=self.current_collection_id).exists()
+        ):
+            self.current_collection_id = 'all'
+            changed = True
+
+        if changed:
+            self.save(update_fields=['current_workspace_id', 'current_collection_id'])
+
+        return changed
